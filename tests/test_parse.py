@@ -154,3 +154,12 @@ def test_check_reboot_required(tmp_path: Path) -> None:
     )
     assert req2 is False
     assert pkgs2 == []
+
+    # Email explicitly states no reboot is required
+    for phrase in (
+        "No reboot is required.",
+        "Reboot is not required.",
+        "No system restart is required.",
+    ):
+        req_neg, _ = check_reboot_required("result", phrase, check_system=False)
+        assert req_neg is False

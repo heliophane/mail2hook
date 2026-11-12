@@ -1,6 +1,6 @@
-# Multi-Server Setup Guide: Ubuntu 24, Ubuntu 25, Debian 12, Debian 13
+# Multi-Server Setup Guide: Ubuntu 24, Ubuntu 26, Debian 12, Debian 13
 
-This guide provides step-by-step instructions for deploying `mail2hook` across any Ubuntu or Debian server to receive system alerts (including `unattended-upgrades`, `cron`, and `apt-listchanges`) directly in Discord without running Postfix, Exim, or any other heavy Mail Transfer Agent (MTA).
+This guide provides step-by-step instructions for deploying `mail2hook` across Ubuntu and Debian servers to receive system alerts (including `unattended-upgrades`, `cron`, and `apt-listchanges`) directly in Discord without running Postfix, Exim, or any other traditional Mail Transfer Agent (MTA).
 
 ---
 
@@ -8,15 +8,15 @@ This guide provides step-by-step instructions for deploying `mail2hook` across a
 
 ```
                       ┌────────────────────────────────────────┐
-                      │ Debian / Ubuntu Server                 │
+                      │ Ubuntu / Debian Server                 │
                       │                                        │
-                      │  unattended-upgrades / cron            │
+                      │  unattended-upgrades / root cron       │
                       │               │                        │
                       │               ▼                        │
                       │      /usr/sbin/sendmail -t -oi         │
                       │               │ (symlink)              │
                       │               ▼                        │
-                      │   /opt/mail2hook/venv/bin/mail2hook   │
+                      │   /opt/mail2hook/venv/bin/mail2hook    │
                       │               │                        │
                       │               ▼ Reads /etc/mail2hook/env
                       │          HTTPS POST                    │
@@ -30,25 +30,25 @@ This guide provides step-by-step instructions for deploying `mail2hook` across a
 
 ## Distribution Quick Reference
 
-| Distribution | Default Python | Pre-installed / Conflicting MTA | Clean Up Command |
+| Distribution | Python | Pre-installed / Conflicting MTA | Clean Up Command |
 | :--- | :--- | :--- | :--- |
-| **Ubuntu 24.04 LTS** (Noble) | Python 3.12 | `postfix`, `bsd-mailx` (optional) | `sudo apt purge postfix bsd-mailx -y` |
-| **Ubuntu 25.04** (Plucky) / 24.10 | Python 3.12 / 3.13 | `postfix`, `bsd-mailx` (optional) | `sudo apt purge postfix bsd-mailx -y` |
-| **Debian 12** (Bookworm) | Python 3.11 | `exim4`, `exim4-base`, `exim4-daemon-light` | `sudo apt purge 'exim4*' postfix bsd-mailx -y` |
-| **Debian 13** (Trixie) | Python 3.12 / 3.13 | `exim4`, `exim4-base`, `exim4-daemon-light` | `sudo apt purge 'exim4*' postfix bsd-mailx -y` |
+| **Ubuntu 24.04 LTS** | Python 3.12 | `postfix`, `bsd-mailx` (if present) | `sudo apt purge postfix bsd-mailx -y` |
+| **Ubuntu 26.04 LTS** | Python 3.13+ | `postfix`, `bsd-mailx` (if present) | `sudo apt purge postfix bsd-mailx -y` |
+| **Debian 12 (Bookworm)** | Python 3.11 | `exim4`, `exim4-base`, `exim4-daemon-light` | `sudo apt purge 'exim4*' postfix bsd-mailx -y` |
+| **Debian 13 (Trixie)** | Python 3.13 | `exim4`, `exim4-base`, `exim4-daemon-light` | `sudo apt purge 'exim4*' postfix bsd-mailx -y` |
 
 > [!NOTE]
-> Debian installs `exim4` by default, which occupies `/usr/sbin/sendmail` via Debian alternatives. Purging `exim4*` frees `/usr/sbin/sendmail` cleanly so `mail2hook` can take over.
+> Debian installs `exim4` by default, which occupies `/usr/sbin/sendmail` via Debian alternatives. Purging `exim4*` frees `/usr/sbin/sendmail` cleanly so `mail2hook` can replace it.
 
 ---
 
 ## Step-by-Step Installation
 
-### Step 1: Install System Prerequisites & Remove MTAs
+### Step 1: Install System Prerequisites & Remove Existing MTAs
 
 Run on the target server:
 
-#### For Ubuntu 24.04 / 25.04:
+#### On Ubuntu 24.04 LTS / Ubuntu 26.04 LTS:
 ```bash
 sudo apt update
 sudo apt install -y python3 python3-venv git unattended-upgrades
@@ -58,7 +58,7 @@ sudo systemctl stop postfix 2>/dev/null || true
 sudo apt purge postfix bsd-mailx -y
 ```
 
-#### For Debian 12 / 13:
+#### On Debian 12 / Debian 13:
 ```bash
 sudo apt update
 sudo apt install -y python3 python3-venv git unattended-upgrades
@@ -73,7 +73,7 @@ sudo apt purge 'exim4*' postfix bsd-mailx -y
 
 ### Step 2: Set Up Virtual Environment and Install `mail2hook`
 
-On any distribution:
+Identical on Ubuntu 24, Ubuntu 26, Debian 12, and Debian 13:
 
 ```bash
 # 1. Create directories
@@ -98,7 +98,7 @@ sudo ln -sf /opt/mail2hook/venv/bin/mail2hook /usr/bin/mailq
 
 ### Step 3: Configure Environment (`/etc/mail2hook/env`)
 
-Create the configuration file:
+Create and lock down the configuration file:
 
 ```bash
 sudo touch /etc/mail2hook/env
@@ -111,10 +111,15 @@ Edit `/etc/mail2hook/env` (`sudo nano /etc/mail2hook/env`):
 # Required: Discord Webhook URL
 DISCORD_WEBHOOK_URL=https://discord.com/api/webhooks/YOUR_WEBHOOK_ID/YOUR_WEBHOOK_TOKEN
 
-# Optional: Friendly Server Name shown in Discord author header (e.g. database, web01, bookstack)
-# If left commented out, mail2hook automatically detects the system hostname.
+# Optional: Friendly server name shown in Discord (defaults to system hostname)
+# Examples: web01, prod-db, bookstack
 SERVER_NAME=my-server-name
 ```
+
+> [!TIP]
+> **`/etc/mail2hook/env` Permissions**:
+> Mode `0600` (owned by `root:root`) keeps your Discord webhook secret unreadable by unprivileged local users while allowing `root` processes (`unattended-upgrades`, root `cron`, `sudo sendmail`) to send alerts.
+> If unprivileged local users or services also need to send mail, run `mail2hook`'s built-in SMTP daemon (`mail2hook --print-systemd-service`) as `root` on `127.0.0.1:25` so local apps can submit mail over localhost without needing read access to `/etc/mail2hook/env`.
 
 ---
 
@@ -138,9 +143,9 @@ Unattended-Upgrade::Sender "unattended-upgrades";
 
 #### Optional: Security Updates Only
 
-If you only want automatic upgrades for security patches and want obsolete kernels auto-removed, edit `/etc/apt/apt.conf.d/50unattended-upgrades` or install the provided example:
+If you only want automatic upgrades for security patches and want obsolete kernels auto-removed, configure `/etc/apt/apt.conf.d/50unattended-upgrades` based on [examples/50unattended-upgrades-security-only.conf](../examples/50unattended-upgrades-security-only.conf):
 
-```bash
+```apt
 // /etc/apt/apt.conf.d/50unattended-upgrades
 Unattended-Upgrade::Allowed-Origins {
     "${distro_id}:${distro_codename}-security";
@@ -154,10 +159,11 @@ Unattended-Upgrade::Remove-Unused-Kernel-Packages "true";
 ### Step 5: Test & Verify
 
 #### 1. Test Sendmail Drop-in Directly
+Run as `root` (or with `sudo`) using single quotes so bash does not expand `!`:
 ```bash
-printf "Subject: unattended-upgrades result for $(hostname): SUCCESS\nFrom: root <root@$(hostname)>\n\nUnattended upgrade result: All upgrades installed\n\nPackages that were upgraded:\n libssl3 openssl\n" | sendmail -t -oi root
+printf 'Subject: unattended-upgrades result for %s: SUCCESS\nFrom: root <root@%s>\n\nUnattended upgrade result: All upgrades installed\n\nPackages that were upgraded:\n libssl3 openssl\n' "$(hostname)" "$(hostname)" | sudo /usr/sbin/sendmail -t -oi root
 ```
-Check your Discord channel — the rich embed with your server name and OS distribution should appear immediately!
+Check your Discord channel — the embed with your server name and OS distribution should appear immediately.
 
 #### 2. Test `mailq`
 ```bash
@@ -169,28 +175,30 @@ mailq
 ```bash
 sudo unattended-upgrades --dry-run --debug
 ```
+*(Note: `unattended-upgrades` only invokes `sendmail` when packages are actually upgraded or an error occurs, not when 0 upgrades are available.)*
 
 ---
 
 ## Managing Multiple Servers in One Discord Channel
 
-When managing multiple servers posting into the same Discord channel:
+When multiple servers post to the same Discord channel, `mail2hook` automatically identifies each host:
 
-1. **Server Badging**: Each server's Discord embed displays:
-   - **Embed Author**: `Server: <SERVER_NAME>` (or system hostname)
-   - **Embed Footer**: `mail2hook • <OS Distribution> (e.g. Ubuntu 24.04 or Debian 12)`
-2. **Distinct Server Identifiers**: Set `SERVER_NAME` in `/etc/mail2hook/env` on each machine (e.g. `SERVER_NAME=prod-db01`, `SERVER_NAME=ingress-proxy`).
-3. **Reboot Required Indicators**: If a security kernel or system library update requires a reboot, the embed prominently displays:
-   - `Reboot: ⚠️ Required`
-   - Server log hint: `Run 'sudo reboot' to apply kernel updates.`
+1. **Server Badging**:
+   - **Embed Author**: `Server: <SERVER_NAME> • <OS Distribution>`
+   - **Embed Fields**: `Server`, `OS`, `Reboot`, `From`, `Date`, `Server Logs`
+   - **Embed Footer**: `mail2hook • <SERVER_NAME> (<OS Distribution>)`
+2. **Distinct Server Identifiers**: Set `SERVER_NAME` in `/etc/mail2hook/env` on each machine (e.g., `SERVER_NAME=prod-db01`, `SERVER_NAME=ingress-proxy`).
+3. **Reboot Required Indicators**: When a kernel or core library update requires a reboot (`/run/reboot-required` exists or email indicates reboot), the embed displays:
+   - `Reboot`: `⚠️ Required` (along with affected packages if listed)
+   - `Server Logs`: includes `sudo reboot` reminder
 
 ---
 
-## Upgrading `mail2hook` in the Future
+## Upgrading `mail2hook`
 
 To upgrade `mail2hook` to the latest release on any server:
 
 ```bash
 sudo /opt/mail2hook/venv/bin/pip install --upgrade git+https://github.com/heliophane/mail2hook.git
 ```
-No service restarts or configuration changes are needed.
+No configuration changes are needed (if running the optional `mail2hook.service` SMTP daemon, restart it with `sudo systemctl restart mail2hook`).

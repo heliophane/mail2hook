@@ -10,6 +10,7 @@ import urllib.request
 from email.utils import parseaddr
 from typing import Any
 
+from mail2hook import __version__
 from mail2hook.config import Config
 from mail2hook.parse import ParsedMessage, truncate_text
 
@@ -294,7 +295,7 @@ def post_to_discord(
         data=data,
         headers={
             "Content-Type": "application/json",
-            "User-Agent": "mail2hook (https://github.com/example/mail2hook, 0.1.0)",
+            "User-Agent": f"mail2hook (https://github.com/heliophane/mail2hook, {__version__})",
         },
         method="POST",
     )

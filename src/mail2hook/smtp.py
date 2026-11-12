@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 from typing import TYPE_CHECKING
 
 from mail2hook.discord import DiscordTemporaryError, build_payload, post_to_discord
@@ -14,6 +15,18 @@ if TYPE_CHECKING:
     from mail2hook.config import Config
 
 logger = logging.getLogger(__name__)
+
+MAX_MESSAGE_BYTES = 10 * 1024 * 1024  # 10 MiB (matches EHLO SIZE advertisement)
+READ_TIMEOUT_SECONDS = 60.0
+_ADDR_BRACKET_RE = re.compile(r"<([^>]*)>")
+
+
+def _extract_envelope_address(value: str) -> str:
+    """Extract the email address from an SMTP MAIL FROM / RCPT TO argument."""
+    match = _ADDR_BRACKET_RE.search(value)
+    if match:
+        return match.group(1).strip()
+    return value.strip().split()[0] if value.strip() else ""
 
 
 class SMTPSession:
@@ -38,93 +51,125 @@ class SMTPSession:
 
     async def handle(self) -> None:
         """Process SMTP commands for the connection."""
-        await self.write_line("220 mail2hook ESMTP ready")
-
-        data_mode = False
-        data_buffer: list[bytes] = []
-
-        while True:
-            line_bytes = await self.reader.readline()
-            if not line_bytes:
-                break
-
-            if data_mode:
-                # Check for end of DATA: single dot on a line
-                if line_bytes in (b".\r\n", b".\n"):
-                    data_mode = False
-                    raw_message = b"".join(data_buffer)
-                    data_buffer.clear()
-                    await self._deliver(raw_message)
-                else:
-                    # RFC 5321 transparency un-stuffing (leading .. becomes .)
-                    if line_bytes.startswith(b".."):
-                        line_bytes = line_bytes[1:]
-                    data_buffer.append(line_bytes)
-                continue
-
-            command_line = line_bytes.decode("utf-8", errors="replace").strip()
-            if not command_line:
-                continue
-
-            parts = command_line.split(" ", 1)
-            cmd = parts[0].upper()
-            arg = parts[1] if len(parts) > 1 else ""
-
-            if cmd in ("HELO", "EHLO"):
-                await self.write_line("250-mail2hook Hello")
-                await self.write_line("250-8BITMIME")
-                await self.write_line("250-SIZE 10485760")
-                await self.write_line("250 OK")
-
-            elif cmd == "MAIL":
-                # Expected format: MAIL FROM:<address>
-                clean_arg = arg.upper()
-                if clean_arg.startswith("FROM:"):
-                    self.envelope_from = arg[5:].strip().strip("<>")
-                    await self.write_line("250 2.1.0 Sender OK")
-                else:
-                    await self.write_line("501 5.5.4 Syntax error in MAIL FROM parameter")
-
-            elif cmd == "RCPT":
-                # Expected format: RCPT TO:<address>
-                clean_arg = arg.upper()
-                if clean_arg.startswith("TO:"):
-                    recipient = arg[3:].strip().strip("<>")
-                    self.envelope_to.append(recipient)
-                    await self.write_line("250 2.1.5 Recipient OK")
-                else:
-                    await self.write_line("501 5.5.4 Syntax error in RCPT TO parameter")
-
-            elif cmd == "DATA":
-                if not self.envelope_to:
-                    await self.write_line("503 5.5.1 Need RCPT command")
-                    continue
-                data_mode = True
-                data_buffer.clear()
-                await self.write_line("354 Start mail input; end with <CRLF>.<CRLF>")
-
-            elif cmd == "RSET":
-                self.envelope_from = ""
-                self.envelope_to.clear()
-                data_buffer.clear()
-                data_mode = False
-                await self.write_line("250 2.0.0 Reset state OK")
-
-            elif cmd == "NOOP":
-                await self.write_line("250 2.0.0 OK")
-
-            elif cmd == "QUIT":
-                await self.write_line("221 2.0.0 mail2hook closing connection")
-                break
-
-            else:
-                await self.write_line(f"500 5.5.2 Command unrecognized: {cmd}")
-
         try:
-            self.writer.close()
-            await self.writer.wait_closed()
-        except Exception:
-            pass
+            await self.write_line("220 mail2hook ESMTP ready")
+
+            data_mode = False
+            data_buffer: list[bytes] = []
+            data_bytes_count = 0
+            data_oversized = False
+
+            while True:
+                try:
+                    line_bytes = await asyncio.wait_for(
+                        self.reader.readline(), timeout=READ_TIMEOUT_SECONDS
+                    )
+                except TimeoutError:
+                    await self.write_line("421 4.4.2 Connection timed out")
+                    break
+
+                if not line_bytes:
+                    break
+
+                if data_mode:
+                    # Check for end of DATA: single dot on a line
+                    if line_bytes in (b".\r\n", b".\n"):
+                        data_mode = False
+                        if data_oversized:
+                            data_buffer.clear()
+                            data_bytes_count = 0
+                            data_oversized = False
+                            await self.write_line(
+                                "552 5.3.4 Message size exceeds fixed maximum message size"
+                            )
+                            continue
+                        raw_message = b"".join(data_buffer)
+                        data_buffer.clear()
+                        data_bytes_count = 0
+                        await self._deliver(raw_message)
+                    else:
+                        # RFC 5321 transparency un-stuffing (leading .. becomes .)
+                        if line_bytes.startswith(b".."):
+                            line_bytes = line_bytes[1:]
+                        if not data_oversized:
+                            if data_bytes_count + len(line_bytes) > MAX_MESSAGE_BYTES:
+                                data_oversized = True
+                                data_buffer.clear()
+                            else:
+                                data_buffer.append(line_bytes)
+                                data_bytes_count += len(line_bytes)
+                    continue
+
+                command_line = line_bytes.decode("utf-8", errors="replace").strip()
+                if not command_line:
+                    continue
+
+                parts = command_line.split(" ", 1)
+                cmd = parts[0].upper()
+                arg = parts[1] if len(parts) > 1 else ""
+
+                if cmd in ("HELO", "EHLO"):
+                    await self.write_line("250-mail2hook Hello")
+                    await self.write_line("250-8BITMIME")
+                    await self.write_line(f"250-SIZE {MAX_MESSAGE_BYTES}")
+                    await self.write_line("250 OK")
+
+                elif cmd == "MAIL":
+                    # Expected format: MAIL FROM:<address> [ESMTP params]
+                    if arg.upper().startswith("FROM:"):
+                        self.envelope_from = _extract_envelope_address(arg[5:])
+                        await self.write_line("250 2.1.0 Sender OK")
+                    else:
+                        await self.write_line("501 5.5.4 Syntax error in MAIL FROM parameter")
+
+                elif cmd == "RCPT":
+                    # Expected format: RCPT TO:<address> [ESMTP params]
+                    if arg.upper().startswith("TO:"):
+                        recipient = _extract_envelope_address(arg[3:])
+                        if not recipient:
+                            await self.write_line("501 5.1.3 Empty recipient address")
+                            continue
+                        self.envelope_to.append(recipient)
+                        await self.write_line("250 2.1.5 Recipient OK")
+                    else:
+                        await self.write_line("501 5.5.4 Syntax error in RCPT TO parameter")
+
+                elif cmd == "DATA":
+                    if not self.envelope_to:
+                        await self.write_line("503 5.5.1 Need RCPT command")
+                        continue
+                    data_mode = True
+                    data_buffer.clear()
+                    data_bytes_count = 0
+                    data_oversized = False
+                    await self.write_line("354 Start mail input; end with <CRLF>.<CRLF>")
+
+                elif cmd == "RSET":
+                    self.envelope_from = ""
+                    self.envelope_to.clear()
+                    data_buffer.clear()
+                    data_bytes_count = 0
+                    data_oversized = False
+                    data_mode = False
+                    await self.write_line("250 2.0.0 Reset state OK")
+
+                elif cmd == "NOOP":
+                    await self.write_line("250 2.0.0 OK")
+
+                elif cmd == "QUIT":
+                    await self.write_line("221 2.0.0 mail2hook closing connection")
+                    break
+
+                else:
+                    await self.write_line(f"500 5.5.2 Command unrecognized: {cmd}")
+        except (ConnectionError, EOFError):
+            logger.debug("SMTP client disconnected")
+        finally:
+            try:
+                self.writer.close()
+                await self.writer.wait_closed()
+            except Exception:
+                pass
 
     async def _deliver(self, raw_bytes: bytes) -> None:
         """Parse received email and post to Discord."""

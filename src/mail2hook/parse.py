@@ -242,22 +242,21 @@ def extract_hostname(subject: str, sender: str, fallback_to_local: bool = False)
     return None
 
 
+_REBOOT_REQUIRED_REGEX = re.compile(
+    r"(?<!\bno\s)(?<!\bnot\s)\breboot(?:\s+is)?\s+required\b"
+    r"|(?<!\bno\s)(?<!\bnot\s)(?<!\bno\ssystem\s)(?<!\bnot\ssystem\s)\brestart(?:\s+is)?\s+required\b"
+    r"|\*\*\*\s*system restart required\s*\*\*\*"
+    r"|\breboot:\s*true\b",
+    re.IGNORECASE,
+)
+
+
 def check_reboot_required(
     subject: str, body: str, check_system: bool = True
 ) -> tuple[bool, list[str]]:
     """Determine whether a reboot is required based on email contents or local system state."""
-    text_lower = f"{subject}\n{body}".lower()
-    email_indicates_reboot = any(
-        phrase in text_lower
-        for phrase in (
-            "reboot is required",
-            "reboot required",
-            "restart required",
-            "system restart required",
-            "*** system restart required ***",
-            "reboot: true",
-        )
-    )
+    text = f"{subject}\n{body}"
+    email_indicates_reboot = bool(_REBOOT_REQUIRED_REGEX.search(text))
 
     system_pkgs: list[str] = []
     system_indicates_reboot = False

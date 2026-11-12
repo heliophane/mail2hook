@@ -155,3 +155,53 @@ def test_smtp_server_commands(test_config: Config) -> None:
             await server_task
 
     asyncio.run(_test())
+
+
+def test_smtp_server_esmtp_params_and_size_limit(
+    test_config: Config, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Test ESMTP parameters on MAIL FROM / RCPT TO and rejection of oversized messages."""
+    monkeypatch.setattr("mail2hook.smtp.MAX_MESSAGE_BYTES", 64)
+
+    async def _test() -> None:
+        stop_event = asyncio.Event()
+        server_task = asyncio.create_task(
+            run_smtp_server("127.0.0.1", 25253, test_config, stop_event=stop_event)
+        )
+        await asyncio.sleep(0.05)
+
+        try:
+            reader, writer = await asyncio.open_connection("127.0.0.1", 25253)
+            await reader.readline()  # banner
+
+            writer.write(b"MAIL FROM:<root@bookstack> SIZE=1234 BODY=8BITMIME\r\n")
+            await writer.drain()
+            assert (await reader.readline()).startswith(b"250 ")
+
+            writer.write(b"RCPT TO:<>\r\n")
+            await writer.drain()
+            assert (await reader.readline()).startswith(b"501 ")
+
+            writer.write(b"RCPT TO:<admin@bookstack>\r\n")
+            await writer.drain()
+            assert (await reader.readline()).startswith(b"250 ")
+
+            writer.write(b"DATA\r\n")
+            await writer.drain()
+            assert (await reader.readline()).startswith(b"354 ")
+
+            writer.write(b"Subject: big\r\n\r\n" + (b"x" * 100) + b"\r\n.\r\n")
+            await writer.drain()
+            assert (await reader.readline()).startswith(b"552 ")
+
+            writer.write(b"QUIT\r\n")
+            await writer.drain()
+            await reader.readline()
+
+            writer.close()
+            await writer.wait_closed()
+        finally:
+            stop_event.set()
+            await server_task
+
+    asyncio.run(_test())

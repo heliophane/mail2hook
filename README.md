@@ -4,7 +4,7 @@
 
 A lightweight Python tool that forwards system emails to a Discord webhook.
 
-`mail2hook` can **completely replace Postfix** as a drop-in `/usr/sbin/sendmail` binary, run as a zero-dependency lightweight SMTP daemon on `127.0.0.1:25`, or integrate into an existing Postfix installation via pipe transport.
+`mail2hook` can **completely replace Postfix/Exim** as a drop-in `/usr/sbin/sendmail` binary, run as a zero-dependency lightweight SMTP daemon on `127.0.0.1:25`, or integrate into an existing Postfix installation via pipe transport.
 
 Specifically designed for automated system notifications:
 - **`unattended-upgrades`** (package installation results, security updates, failure warnings, reboot notifications)
@@ -15,10 +15,10 @@ Specifically designed for automated system notifications:
 
 ## Features
 
-- **No Postfix Required**: Acts directly as a `/usr/sbin/sendmail` and `/usr/bin/mailq` drop-in binary. Accepts standard sendmail flags (`-t`, `-oi`, `-i`, `-f`, `-F`, `-bm`, `-bp`, `-bv`, `-B`, `-o...`).
+- **No Postfix/Exim Required**: Acts directly as a `/usr/sbin/sendmail` and `/usr/bin/mailq` drop-in binary. Accepts standard sendmail flags (`-t`, `-oi`, `-i`, `-f`, `-F`, `-bm`, `-bp`, `-bv`, `-B`, `-o...`).
 - **Built-in Async SMTP Daemon**: Optional zero-dependency lightweight RFC 5321 SMTP server (`mail2hook --smtp-listen 127.0.0.1:25`) for services that deliver over TCP sockets.
-- **Zero Heavy Dependencies**: Uses standard Python library modules (`email`, `urllib.request`, `asyncio`, `argparse`) with only `python-dotenv` for configuration loading.
-- **Reboot Detection**: Automatically alerts with `Reboot: ⚠️ Required` (and provides a handy `sudo reboot` hint) when `/var/run/reboot-required` exists or is indicated in package logs.
+- **Near-Zero Dependencies**: Uses standard Python library modules (`email`, `urllib.request`, `asyncio`, `argparse`) with only `python-dotenv` for configuration loading.
+- **Reboot Detection**: Automatically displays `Reboot: ⚠️ Required` (or `🟢 Not needed`) and adds a `sudo reboot` hint when `/run/reboot-required` exists or an upgrade log indicates a restart is needed.
 - **Multi-Server Friendly**: Automatically detects OS distribution and server hostname, with optional `SERVER_NAME` override.
 - **Strict Security**:
   - Webhook URL token is never logged or printed in clear text.
@@ -42,22 +42,22 @@ Specifically designed for automated system notifications:
 
 ---
 
-## 2. Installation (Ubuntu 24/25 & Debian 12/13)
+## 2. Installation (Ubuntu 24/26 & Debian 12/13)
 
-For an in-depth multi-server guide, see [docs/MULTI_SERVER_SETUP.md](docs/MULTI_SERVER_SETUP.md).
+For a complete multi-server deployment walkthrough, see [docs/MULTI_SERVER_SETUP.md](docs/MULTI_SERVER_SETUP.md).
 
 ### Step 1: Install prerequisites & remove existing MTAs
 
-Install Python virtual environment tools and remove any conflicting Mail Transfer Agents (Postfix, Exim, etc.):
+Install Python virtual environment tools and remove any conflicting Mail Transfer Agents (`postfix`, `exim4`, etc.):
 
-**On Ubuntu 24.04 LTS & 25.04:**
+**On Ubuntu 24.04 LTS & 26.04 LTS:**
 ```bash
 sudo apt update && sudo apt install -y python3 python3-venv git unattended-upgrades
 sudo systemctl stop postfix 2>/dev/null || true
 sudo apt purge postfix bsd-mailx -y
 ```
 
-**On Debian 12 & 13:**
+**On Debian 12 (Bookworm) & Debian 13 (Trixie):**
 ```bash
 sudo apt update && sudo apt install -y python3 python3-venv git unattended-upgrades
 # Debian ships with exim4 by default; purge it to free /usr/sbin/sendmail
@@ -111,6 +111,8 @@ DISCORD_WEBHOOK_URL=https://discord.com/api/webhooks/123456789012345678/example-
 # DISCORD_USERNAME=mail2hook
 ```
 
+*(With `0600` permissions, `root` processes such as `unattended-upgrades` and root `cron` jobs can read the config while keeping the webhook secret hidden from unprivileged users. If non-root local services need to send mail, use the built-in SMTP daemon below.)*
+
 ---
 
 ## 3. Configure `unattended-upgrades`
@@ -129,7 +131,7 @@ mail2hook --print-apt-config | sudo tee /etc/apt/apt.conf.d/52mail2hook
 
 ## 4. Alternative: Built-in SMTP Daemon (`127.0.0.1:25`)
 
-If you have applications on your server that connect to `localhost:25` over TCP rather than invoking `sendmail`, you can run `mail2hook` as a systemd SMTP service without needing Postfix.
+If you have applications on your server that connect to `localhost:25` over TCP rather than invoking `sendmail`, or unprivileged local users that should send mail without reading `/etc/mail2hook/env`, you can run `mail2hook` as a systemd SMTP service without Postfix:
 
 1. Generate and install the systemd service unit:
    ```bash
@@ -173,18 +175,18 @@ If your server already uses Postfix for other mail routing, configure Postfix to
 
 ---
 
-## 6. Testing & Verification
+## 6. CLI Usage & Testing
 
 ### Test sendmail drop-in directly:
 
 ```bash
-printf "Subject: unattended-upgrades result for server: SUCCESS\nFrom: root <root@example.com>\n\nAll upgrades installed successfully.\nPackages that were upgraded:\n libssl3 openssl\n" | sendmail -t -oi root
+printf 'Subject: unattended-upgrades result for server: SUCCESS\nFrom: root <root@example.com>\n\nAll upgrades installed successfully.\nPackages that were upgraded:\n libssl3 openssl\n' | sudo /usr/sbin/sendmail -t -oi root
 ```
 
 ### Test dry-run output (does not send to Discord):
 
 ```bash
-printf "Subject: Test Notification\nFrom: root <root@example.com>\n\nTest message." | mail2hook --dry-run
+printf 'Subject: Test Notification\nFrom: root <root@example.com>\n\nTest message.\n' | sudo mail2hook --dry-run
 ```
 
 ### Test live unattended-upgrades run:
@@ -199,6 +201,17 @@ sudo unattended-upgrades --dry-run --debug
 mailq
 # Output: Mail queue is empty
 ```
+
+### Command Flags:
+
+- `--file PATH`: Read raw email from a file instead of stdin.
+- `--dry-run`: Parse and format payload, printing JSON to stdout without sending to Discord.
+- `--env-file PATH`: Use a specific environment file instead of `/etc/mail2hook/env` or `.env`.
+- `--smtp-listen [HOST:]PORT`: Run the built-in SMTP daemon (default `127.0.0.1:25`).
+- `--print-apt-config`: Print recommended `/etc/apt/apt.conf.d/52mail2hook` configuration and exit.
+- `--print-systemd-service`: Print systemd service unit template for `--smtp-listen` and exit.
+- `--version`, `-V`: Display version information and exit.
+- Sendmail compatibility flags: `-t`, `-i`, `-oi`, `-bm`, `-bp`, `-bv`, `-bs`, `-f`, `-r`, `-F`, `-B`, `-v`, `-o...`
 
 ---
 

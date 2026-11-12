@@ -166,7 +166,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "-bs",
         action="store_true",
-        help="Run SMTP on standard input.",
+        help="Accepted for sendmail CLI flag compatibility.",
     )
     parser.add_argument(
         "-f",
