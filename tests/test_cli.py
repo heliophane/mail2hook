@@ -33,6 +33,15 @@ def test_cli_version(capsys: pytest.CaptureFixture[str]) -> None:
     assert f"mail2hook {__version__}" in captured.out
 
 
+def test_cli_print_apt_config(capsys: pytest.CaptureFixture[str]) -> None:
+    # Does not require DISCORD_WEBHOOK_URL
+    exit_code = run(["--print-apt-config"])
+    assert exit_code == EXIT_OK
+    captured = capsys.readouterr()
+    assert "Unattended-Upgrade::Mail" in captured.out
+    assert "52mail2hook" in captured.out
+
+
 def test_cli_missing_config(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:

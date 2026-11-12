@@ -162,20 +162,44 @@ sudo newaliases
 
 ## 5. Unattended-Upgrades Configuration
 
-To forward automated update reports to Discord, configure Debian's `unattended-upgrades` to send email to your `mail2hook` address.
+To forward automated update reports to Discord, you can automatically install the recommended drop-in configuration using `mail2hook`:
 
-Edit `/etc/apt/apt.conf.d/50unattended-upgrades`:
+### Option A: Install Modular Drop-in Configuration (Recommended)
 
-```apt
-// Send email report to mail2hook
-Unattended-Upgrade::Mail "mail2hook@example.com";
+Generate and install the drop-in configuration directly with one command:
 
-// Set to "always" to get notifications for all upgrades,
-// or "only-on-error" to notify only when an upgrade fails
-Unattended-Upgrade::MailReport "always";
+```bash
+mail2hook --print-apt-config | sudo tee /etc/apt/apt.conf.d/52mail2hook
 ```
 
-*(Replace `mail2hook@example.com` with the local user or transport address configured in Postfix.)*
+This creates `/etc/apt/apt.conf.d/52mail2hook`:
+```apt
+// /etc/apt/apt.conf.d/52mail2hook
+// Default unattended-upgrades configuration for mail2hook
+
+APT::Periodic::Update-Package-Lists "1";
+APT::Periodic::Unattended-Upgrade "1";
+APT::Periodic::AutocleanInterval "7";
+
+// Send reports to mail2hook
+Unattended-Upgrade::Mail "mail2hook";
+
+// "always" sends Discord notifications for every run; "only-on-error" alerts only on failure
+Unattended-Upgrade::MailReport "always";
+
+Unattended-Upgrade::Sender "unattended-upgrades";
+```
+
+*(Using a dedicated `52mail2hook` drop-in file avoids modifying `/etc/apt/apt.conf.d/50unattended-upgrades`, preventing dpkg configuration merge prompts during future Debian/Ubuntu package upgrades).*
+
+### Option B: Edit `/etc/apt/apt.conf.d/50unattended-upgrades` Manually
+
+Alternatively, edit `/etc/apt/apt.conf.d/50unattended-upgrades` directly:
+
+```apt
+Unattended-Upgrade::Mail "mail2hook";
+Unattended-Upgrade::MailReport "always";
+```
 
 ---
 
@@ -208,6 +232,7 @@ printf "Subject: Test Notification\nFrom: root@server01.example.com\n\nThis is a
 - `--file PATH`, `-f PATH`: Read raw email from a file instead of stdin.
 - `--dry-run`: Parse and format payload, printing JSON to stdout without sending to Discord.
 - `--env-file PATH`: Use a specific environment file instead of default locations.
+- `--print-apt-config`: Print recommended `/etc/apt/apt.conf.d/52mail2hook` configuration and exit.
 - `--version`, `-v`: Display version information and exit.
 
 ---

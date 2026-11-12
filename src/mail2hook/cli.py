@@ -25,6 +25,31 @@ EXIT_TEMPFAIL = 75  # EX_TEMPFAIL: Temporary failure (retry later)
 EXIT_CONFIG = 78  # EX_CONFIG: Configuration error (missing/invalid webhook, etc.)
 
 
+DEFAULT_APT_CONFIG = """// /etc/apt/apt.conf.d/52mail2hook
+// Default unattended-upgrades configuration for mail2hook.
+//
+// To install on Debian/Ubuntu:
+//   mail2hook --print-apt-config | sudo tee /etc/apt/apt.conf.d/52mail2hook
+
+// 1. Enable automatic package update lists and unattended upgrades
+APT::Periodic::Update-Package-Lists "1";
+APT::Periodic::Unattended-Upgrade "1";
+APT::Periodic::AutocleanInterval "7";
+
+// 2. Deliver upgrade reports to mail2hook
+// Set to "mail2hook" if configured via Postfix transport/alias, or "root" if aliased to mail2hook.
+Unattended-Upgrade::Mail "mail2hook";
+
+// 3. Reporting frequency:
+// - "always": Send a Discord notification on every upgrade run (recommended)
+// - "only-on-error": Send a Discord notification only when an upgrade fails
+Unattended-Upgrade::MailReport "always";
+
+// 4. Sender identity for clean email headers
+Unattended-Upgrade::Sender "unattended-upgrades";
+"""
+
+
 def build_parser() -> argparse.ArgumentParser:
     """Create command-line argument parser."""
     parser = argparse.ArgumentParser(
@@ -50,6 +75,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="Path to custom environment file (defaults to /etc/mail2hook/env or .env).",
     )
     parser.add_argument(
+        "--print-apt-config",
+        action="store_true",
+        help="Print recommended /etc/apt/apt.conf.d/52mail2hook configuration and exit.",
+    )
+    parser.add_argument(
         "--version",
         "-v",
         action="version",
@@ -62,6 +92,10 @@ def run(argv: list[str] | None = None) -> int:
     """Execute mail2hook CLI and return the appropriate exit code."""
     parser = build_parser()
     args = parser.parse_args(argv)
+
+    if args.print_apt_config:
+        sys.stdout.write(DEFAULT_APT_CONFIG)
+        return EXIT_OK
 
     # 1. Load and validate configuration
     try:

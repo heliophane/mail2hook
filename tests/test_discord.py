@@ -82,11 +82,57 @@ def test_build_payload_structure_and_limits() -> None:
 
     # Fields
     field_names = [f["name"] for f in embed["fields"]]
+    assert "Server" in field_names
     assert "From" in field_names
     assert "Date" in field_names
+    assert "Server Logs" in field_names
+
+    # Check author
+    assert embed["author"]["name"] == "Server: box01.example.com"
+
+    # Check log command in Server Logs field
+    log_field = next(f for f in embed["fields"] if f["name"] == "Server Logs")
+    assert "journalctl" in log_field["value"]
 
     # Footer
     assert "box01.example.com" in embed["footer"]["text"]
+
+
+def test_format_sender() -> None:
+    from mail2hook.discord import format_sender
+
+    # Duplicate name and localpart
+    assert format_sender("root <root@ubuntu24>", "ubuntu24") == "root@ubuntu24"
+    # Bare local name without @
+    assert format_sender("root", "bookstack") == "root@bookstack"
+    # @localhost
+    assert format_sender("root@localhost", "bookstack") == "root@bookstack"
+    # Distinct name and address
+    assert (
+        format_sender("Alerts System <alerts@monitor.example.com>", "server01")
+        == "Alerts System (alerts@monitor.example.com)"
+    )
+
+
+def test_get_log_reminder() -> None:
+    from mail2hook.discord import get_log_reminder
+
+    # Unattended upgrades success
+    succ = get_log_reminder(
+        "unattended-upgrades result: SUCCESS", "All upgrades", "ubuntu24", "success"
+    )
+    assert "sudo tail -n 50 /var/log/unattended-upgrades/unattended-upgrades.log" in succ
+    assert "`ubuntu24`" in succ
+
+    # Unattended upgrades failure
+    fail = get_log_reminder(
+        "unattended-upgrades result: FAILURE", "dpkg error", "ubuntu24", "failure"
+    )
+    assert "unattended-upgrades-dpkg.log" in fail
+
+    # Generic mail
+    gen = get_log_reminder("Cron output", "Backup ran", "ubuntu24", "info")
+    assert "journalctl -xe" in gen
 
 
 def test_build_payload_colors() -> None:

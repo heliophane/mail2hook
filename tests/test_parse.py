@@ -123,6 +123,12 @@ def test_extract_hostname() -> None:
         == "host01.example.com"
     )
     assert (
+        extract_hostname("unattended-upgrades result for ubuntu24: SUCCESS", "root@ubuntu24")
+        == "ubuntu24"
+    )
+    assert extract_hostname("Nightly run on bookstack", "root@localhost") == "bookstack"
+    assert (
         extract_hostname("Cron job output", "root@server02.infra.local") == "server02.infra.local"
     )
     assert extract_hostname("Generic Subject", "simpleuser") is None
+    assert extract_hostname("Generic Subject", "simpleuser", fallback_to_local=True) is not None

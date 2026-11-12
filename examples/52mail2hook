@@ -1,0 +1,24 @@
+// /etc/apt/apt.conf.d/52mail2hook
+// Default unattended-upgrades configuration for mail2hook.
+//
+// To install on Debian/Ubuntu:
+//   mail2hook --print-apt-config | sudo tee /etc/apt/apt.conf.d/52mail2hook
+// or:
+//   sudo cp examples/52mail2hook /etc/apt/apt.conf.d/52mail2hook
+
+// 1. Enable automatic package update lists and unattended upgrades
+APT::Periodic::Update-Package-Lists "1";
+APT::Periodic::Unattended-Upgrade "1";
+APT::Periodic::AutocleanInterval "7";
+
+// 2. Deliver upgrade reports to mail2hook
+// Set to "mail2hook" if configured via Postfix transport/alias, or "root" if aliased to mail2hook.
+Unattended-Upgrade::Mail "mail2hook";
+
+// 3. Reporting frequency:
+// - "always": Send a Discord notification on every upgrade run (recommended)
+// - "only-on-error": Send a Discord notification only when an upgrade fails
+Unattended-Upgrade::MailReport "always";
+
+// 4. Sender identity for clean email headers
+Unattended-Upgrade::Sender "unattended-upgrades";

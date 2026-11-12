@@ -203,26 +203,39 @@ def detect_status(subject: str, body: str) -> str:
 
 
 _HOSTNAME_REGEX = re.compile(
-    r"\b(?:for|on|at|host:?)\s+([a-zA-Z0-9][-a-zA-Z0-9]*(?:\.[a-zA-Z0-9][-a-zA-Z0-9]*)+)",
+    r"\b(?:for|on|at|host:?)\s+([a-zA-Z0-9][-a-zA-Z0-9]*(?:\.[a-zA-Z0-9][-a-zA-Z0-9]*)*)",
     re.IGNORECASE,
 )
 
+_IGNORED_HOST_WORDS = frozenset(
+    {"all", "the", "a", "an", "root", "job", "cron", "upgrades", "upgrade", "result", "mail"}
+)
 
-def extract_hostname(subject: str, sender: str) -> str | None:
-    """Try to infer the host name from the subject or sender."""
-    # Check subject like 'unattended-upgrades result for server01.example.com: SUCCESS'
+
+def extract_hostname(subject: str, sender: str, fallback_to_local: bool = False) -> str | None:
+    """Try to infer the host name from the subject or sender, optionally falling back to local."""
+    # Check subject like 'unattended-upgrades result for ubuntu24: SUCCESS'
     match = _HOSTNAME_REGEX.search(subject)
     if match:
         candidate = match.group(1).rstrip(":.,")
-        # Ensure it's not a generic word like 'the' or 'all'
-        if candidate.lower() not in ("all", "the", "a", "an", "root"):
+        if candidate.lower() not in _IGNORED_HOST_WORDS:
             return candidate
 
-    # Check sender domain e.g. root@server01.example.com
+    # Check sender domain e.g. root@ubuntu24 or root@server01.example.com
     if "@" in sender:
         domain = sender.split("@")[-1].strip(">").strip()
-        if domain and "." in domain:
+        if domain and domain.lower() not in ("localhost", "localdomain"):
             return domain
+
+    if fallback_to_local:
+        try:
+            import socket
+
+            local_host = socket.gethostname()
+            if local_host and local_host.lower() not in ("localhost", "localhost.localdomain"):
+                return local_host
+        except Exception:
+            pass
 
     return None
 
@@ -250,7 +263,7 @@ def parse_email(raw_bytes: bytes, max_body_chars: int = 1500) -> ParsedMessage:
         body = truncate_text(raw_body, max_chars=max_body_chars)
 
     status = detect_status(subject=subject, body=raw_body)
-    hostname = extract_hostname(subject=subject, sender=sender)
+    hostname = extract_hostname(subject=subject, sender=sender, fallback_to_local=True)
 
     return ParsedMessage(
         sender=sender,

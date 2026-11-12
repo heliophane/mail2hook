@@ -7,6 +7,7 @@ import logging
 import time
 import urllib.error
 import urllib.request
+from email.utils import parseaddr
 from typing import Any
 
 from mail2hook.config import Config
@@ -46,6 +47,56 @@ def redact_webhook_url(url: str) -> str:
     return "[REDACTED_WEBHOOK_URL]"
 
 
+def format_sender(sender: str, hostname: str | None) -> str:
+    """Format sender cleanly for Discord without duplicate names or broken angles."""
+    name, addr = parseaddr(sender)
+    name = name.strip()
+    addr = addr.strip()
+
+    # If address has no @ or is localhost, associate with hostname if known
+    if addr:
+        if "@" not in addr and hostname:
+            addr = f"{addr}@{hostname}"
+        elif (addr.endswith("@localhost") or addr.endswith("@localdomain")) and hostname:
+            user = addr.split("@")[0]
+            addr = f"{user}@{hostname}"
+
+    if not addr:
+        return sender.strip()
+
+    # If name is redundant with the localpart (e.g. name='root', addr='root@ubuntu24')
+    localpart = addr.split("@")[0]
+    if not name or name.lower() == localpart.lower():
+        return addr
+
+    return f"{name} ({addr})"
+
+
+def get_log_reminder(subject: str, body: str, hostname: str | None, status: str) -> str:
+    """Generate log inspection instructions and shell commands."""
+    sub_lower = subject.lower()
+    body_lower = body.lower()
+    host_display = f" on `{hostname}`" if hostname else ""
+
+    if "unattended" in sub_lower or "unattended" in body_lower:
+        if status == "failure":
+            return (
+                f"Check upgrade failure logs{host_display}:\n"
+                "```bash\n"
+                "sudo tail -n 50 /var/log/unattended-upgrades/unattended-upgrades.log\n"
+                "sudo tail -n 50 /var/log/unattended-upgrades/unattended-upgrades-dpkg.log\n"
+                "```"
+            )
+        return (
+            f"Check upgrade logs{host_display}:\n"
+            "```bash\n"
+            "sudo tail -n 50 /var/log/unattended-upgrades/unattended-upgrades.log\n"
+            "```"
+        )
+
+    return f"Check system logs{host_display}:\n```bash\nsudo journalctl -xe\n```"
+
+
 def build_payload(msg: ParsedMessage, config: Config) -> dict[str, Any]:
     """Construct the Discord webhook payload dictionary."""
     color = COLOR_INFO
@@ -57,13 +108,25 @@ def build_payload(msg: ParsedMessage, config: Config) -> dict[str, Any]:
     max_desc = min(config.max_body_chars, MAX_DESCRIPTION_CHARS)
     desc = truncate_text(msg.body, max_desc) if msg.body else "(no content)"
 
-    fields: list[dict[str, Any]] = [
+    fields: list[dict[str, Any]] = []
+
+    if msg.hostname:
+        fields.append(
+            {
+                "name": "Server",
+                "value": f"`{msg.hostname}`",
+                "inline": True,
+            }
+        )
+
+    sender_formatted = format_sender(msg.sender, msg.hostname)
+    fields.append(
         {
             "name": "From",
-            "value": truncate_text(msg.sender, MAX_FIELD_VALUE_CHARS),
+            "value": truncate_text(sender_formatted, MAX_FIELD_VALUE_CHARS),
             "inline": True,
-        },
-    ]
+        }
+    )
 
     if msg.date:
         fields.append(
@@ -74,6 +137,15 @@ def build_payload(msg: ParsedMessage, config: Config) -> dict[str, Any]:
             }
         )
 
+    log_reminder = get_log_reminder(msg.subject, msg.body, msg.hostname, msg.status)
+    fields.append(
+        {
+            "name": "Server Logs",
+            "value": log_reminder,
+            "inline": False,
+        }
+    )
+
     footer_text = f"mail2hook • {msg.hostname}" if msg.hostname else "mail2hook"
 
     embed: dict[str, Any] = {
@@ -83,6 +155,9 @@ def build_payload(msg: ParsedMessage, config: Config) -> dict[str, Any]:
         "fields": fields,
         "footer": {"text": truncate_text(footer_text, 2048)},
     }
+
+    if msg.hostname:
+        embed["author"] = {"name": f"Server: {msg.hostname}"}
 
     return {
         "username": config.discord_username,
