@@ -155,6 +155,46 @@ def test_get_log_reminder() -> None:
     gen = get_log_reminder("Cron output", "Backup ran", "ubuntu24", "info")
     assert "journalctl -xe" in gen
 
+    # Reboot required adds sudo reboot
+    reboot_log = get_log_reminder(
+        "unattended-upgrades result", "linux-image", "ubuntu24", "success", reboot_required=True
+    )
+    assert "sudo reboot" in reboot_log
+
+
+def test_build_payload_reboot_field() -> None:
+    config = Config(discord_webhook_url=FAKE_WEBHOOK_URL)
+
+    # 1. Upgrade message with reboot required
+    msg_reboot = ParsedMessage(
+        sender="root@bookstack",
+        subject="unattended-upgrades result for bookstack: SUCCESS",
+        date="Wed, 11 Nov 2026 12:00:00 +0000",
+        body="All upgrades installed",
+        status="success",
+        hostname="bookstack",
+        reboot_required=True,
+        reboot_packages=["linux-image-6.8.0-generic"],
+    )
+    payload = build_payload(msg_reboot, config)
+    reboot_field = next(f for f in payload["embeds"][0]["fields"] if f["name"] == "Reboot")
+    assert "Required" in reboot_field["value"]
+    assert "linux-image-6.8.0-generic" in reboot_field["value"]
+
+    # 2. Upgrade message without reboot required
+    msg_no_reboot = ParsedMessage(
+        sender="root@bookstack",
+        subject="unattended-upgrades result for bookstack: SUCCESS",
+        date="Wed, 11 Nov 2026 12:00:00 +0000",
+        body="All upgrades installed",
+        status="success",
+        hostname="bookstack",
+        reboot_required=False,
+    )
+    payload_no = build_payload(msg_no_reboot, config)
+    reboot_field_no = next(f for f in payload_no["embeds"][0]["fields"] if f["name"] == "Reboot")
+    assert "Not needed" in reboot_field_no["value"]
+
 
 def test_build_payload_colors() -> None:
     config = Config(discord_webhook_url=FAKE_WEBHOOK_URL)

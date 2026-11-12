@@ -132,3 +132,25 @@ def test_extract_hostname() -> None:
     )
     assert extract_hostname("Generic Subject", "simpleuser") is None
     assert extract_hostname("Generic Subject", "simpleuser", fallback_to_local=True) is not None
+
+
+def test_check_reboot_required(tmp_path: Path) -> None:
+    from mail2hook.parse import check_reboot_required
+
+    # Email mentions reboot
+    req1, pkgs1 = check_reboot_required(
+        "unattended-upgrades result",
+        "Packages upgraded: linux-image-generic\nA reboot is required to finish install.",
+        check_system=False,
+    )
+    assert req1 is True
+    assert pkgs1 == []
+
+    # Email does not mention reboot
+    req2, pkgs2 = check_reboot_required(
+        "unattended-upgrades result",
+        "All upgrades installed successfully",
+        check_system=False,
+    )
+    assert req2 is False
+    assert pkgs2 == []

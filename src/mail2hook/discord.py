@@ -72,11 +72,19 @@ def format_sender(sender: str, hostname: str | None) -> str:
     return f"{name} ({addr})"
 
 
-def get_log_reminder(subject: str, body: str, hostname: str | None, status: str) -> str:
+def get_log_reminder(
+    subject: str,
+    body: str,
+    hostname: str | None,
+    status: str,
+    reboot_required: bool = False,
+) -> str:
     """Generate log inspection instructions and shell commands."""
     sub_lower = subject.lower()
     body_lower = body.lower()
     host_display = f" on `{hostname}`" if hostname else ""
+
+    reboot_hint = "\n\nReboot server:\n```bash\nsudo reboot\n```" if reboot_required else ""
 
     if "unattended" in sub_lower or "unattended" in body_lower:
         if status == "failure":
@@ -86,15 +94,17 @@ def get_log_reminder(subject: str, body: str, hostname: str | None, status: str)
                 "sudo tail -n 50 /var/log/unattended-upgrades/unattended-upgrades.log\n"
                 "sudo tail -n 50 /var/log/unattended-upgrades/unattended-upgrades-dpkg.log\n"
                 "```"
+                f"{reboot_hint}"
             )
         return (
             f"Check upgrade logs{host_display}:\n"
             "```bash\n"
             "sudo tail -n 50 /var/log/unattended-upgrades/unattended-upgrades.log\n"
             "```"
+            f"{reboot_hint}"
         )
 
-    return f"Check system logs{host_display}:\n```bash\nsudo journalctl -xe\n```"
+    return f"Check system logs{host_display}:\n```bash\nsudo journalctl -xe\n```{reboot_hint}"
 
 
 def get_os_info() -> str | None:
@@ -188,6 +198,28 @@ def build_payload(msg: ParsedMessage, config: Config) -> dict[str, Any]:
             }
         )
 
+    # Show Reboot field for upgrade mails or whenever a reboot is detected
+    is_upgrade = "unattended" in msg.subject.lower() or "unattended" in msg.body.lower()
+    if msg.reboot_required or is_upgrade:
+        if msg.reboot_required:
+            if msg.reboot_packages:
+                pkgs_preview = ", ".join(msg.reboot_packages[:2])
+                if len(msg.reboot_packages) > 2:
+                    pkgs_preview += f" (+{len(msg.reboot_packages) - 2} more)"
+                reboot_value = f"⚠️ **Required** (`{pkgs_preview}`)"
+            else:
+                reboot_value = "⚠️ **Required**"
+        else:
+            reboot_value = "🟢 Not needed"
+
+        fields.append(
+            {
+                "name": "Reboot",
+                "value": reboot_value,
+                "inline": True,
+            }
+        )
+
     sender_formatted = format_sender(msg.sender, hostname)
     fields.append(
         {
@@ -206,7 +238,13 @@ def build_payload(msg: ParsedMessage, config: Config) -> dict[str, Any]:
             }
         )
 
-    log_reminder = get_log_reminder(msg.subject, msg.body, hostname, msg.status)
+    log_reminder = get_log_reminder(
+        msg.subject,
+        msg.body,
+        hostname,
+        msg.status,
+        reboot_required=msg.reboot_required,
+    )
     fields.append(
         {
             "name": "Server Logs",

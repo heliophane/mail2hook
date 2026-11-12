@@ -22,3 +22,10 @@ Unattended-Upgrade::MailReport "always";
 
 // 4. Sender identity for clean email headers
 Unattended-Upgrade::Sender "unattended-upgrades";
+
+// 5. Reboot settings (optional)
+// By default, unattended-upgrades will NOT reboot automatically.
+// Mail2hook will notify you in Discord with "Reboot: Required" when a reboot is needed.
+// To enable automatic reboots when a kernel or core library update requires it:
+// Unattended-Upgrade::Automatic-Reboot "true";
+// Unattended-Upgrade::Automatic-Reboot-Time "03:00";

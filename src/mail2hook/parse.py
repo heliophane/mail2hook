@@ -5,7 +5,7 @@ from __future__ import annotations
 import email
 import html
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from email import policy
 from email.message import EmailMessage
 from html.parser import HTMLParser
@@ -25,6 +25,8 @@ class ParsedMessage:
     body: str
     status: str = "info"  # "success", "failure", or "info"
     hostname: str | None = None
+    reboot_required: bool = False
+    reboot_packages: list[str] = field(default_factory=list)
 
 
 class _HTMLTextExtractor(HTMLParser):
@@ -240,6 +242,51 @@ def extract_hostname(subject: str, sender: str, fallback_to_local: bool = False)
     return None
 
 
+def check_reboot_required(
+    subject: str, body: str, check_system: bool = True
+) -> tuple[bool, list[str]]:
+    """Determine whether a reboot is required based on email contents or local system state."""
+    text_lower = f"{subject}\n{body}".lower()
+    email_indicates_reboot = any(
+        phrase in text_lower
+        for phrase in (
+            "reboot is required",
+            "reboot required",
+            "restart required",
+            "system restart required",
+            "*** system restart required ***",
+            "reboot: true",
+        )
+    )
+
+    system_pkgs: list[str] = []
+    system_indicates_reboot = False
+    if check_system:
+        try:
+            from pathlib import Path
+
+            for path in (Path("/run/reboot-required"), Path("/var/run/reboot-required")):
+                if path.is_file():
+                    system_indicates_reboot = True
+                    break
+
+            for pkg_file in (
+                Path("/run/reboot-required.pkgs"),
+                Path("/var/run/reboot-required.pkgs"),
+            ):
+                if pkg_file.is_file():
+                    system_pkgs = [
+                        p.strip()
+                        for p in pkg_file.read_text(encoding="utf-8", errors="replace").splitlines()
+                        if p.strip()
+                    ]
+                    break
+        except Exception:
+            pass
+
+    return (email_indicates_reboot or system_indicates_reboot), system_pkgs
+
+
 def parse_email(raw_bytes: bytes, max_body_chars: int = 1500) -> ParsedMessage:
     """Parse raw email bytes into a structured ParsedMessage."""
     if not raw_bytes or not raw_bytes.strip():
@@ -264,6 +311,9 @@ def parse_email(raw_bytes: bytes, max_body_chars: int = 1500) -> ParsedMessage:
 
     status = detect_status(subject=subject, body=raw_body)
     hostname = extract_hostname(subject=subject, sender=sender, fallback_to_local=True)
+    reboot_required, reboot_packages = check_reboot_required(
+        subject=subject, body=raw_body, check_system=True
+    )
 
     return ParsedMessage(
         sender=sender,
@@ -272,4 +322,6 @@ def parse_email(raw_bytes: bytes, max_body_chars: int = 1500) -> ParsedMessage:
         body=body,
         status=status,
         hostname=hostname,
+        reboot_required=reboot_required,
+        reboot_packages=reboot_packages,
     )
