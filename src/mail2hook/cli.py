@@ -19,7 +19,7 @@ from mail2hook.discord import (
 )
 from mail2hook.filters import should_process_message
 from mail2hook.parse import ParseError, parse_email
-from mail2hook.smtp import run_smtp_server
+from mail2hook.smtp import MAX_MESSAGE_BYTES, run_smtp_server
 
 # Postfix / sysexits.h standard exit codes
 EXIT_OK = 0  # EX_OK: Success or message filtered out
@@ -208,6 +208,42 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _build_fallback_sender(args: argparse.Namespace) -> str | None:
+    """Build a fallback sender string from sendmail -f/-r and -F flags if provided."""
+    sender_addr = (getattr(args, "sender", None) or "").strip()
+    full_name = (getattr(args, "full_name", None) or "").strip()
+    if sender_addr and full_name:
+        return f"{full_name} <{sender_addr}>"
+    if sender_addr:
+        return sender_addr
+    if full_name:
+        return full_name
+    return None
+
+
+def _ignore_dots_enabled(args: argparse.Namespace) -> bool:
+    """Return True if sendmail -i / -oi (ignore single dots) is active."""
+    if getattr(args, "i", False) or getattr(args, "oi", False):
+        return True
+    options: list[str] = getattr(args, "options", None) or []
+    return any(opt.startswith("i") for opt in options)
+
+
+def _normalize_sendmail_input(raw_bytes: bytes, *, ignore_dots: bool) -> bytes:
+    """Handle standard sendmail single-dot EOF and dot-unstuffing when -i/-oi is not set."""
+    if ignore_dots:
+        return raw_bytes
+
+    out_lines: list[bytes] = []
+    for line in raw_bytes.splitlines(keepends=True):
+        if line in (b".\r\n", b".\n", b"."):
+            break
+        if line.startswith(b".."):
+            line = line[1:]
+        out_lines.append(line)
+    return b"".join(out_lines)
+
+
 def run(argv: list[str] | None = None) -> int:
     """Execute mail2hook CLI and return the appropriate exit code."""
     parser = build_parser()
@@ -274,22 +310,37 @@ def run(argv: list[str] | None = None) -> int:
             return EXIT_CONFIG
         return EXIT_OK
 
-    # 2. Read raw email bytes
+    # 2. Read raw email bytes (bounded to MAX_MESSAGE_BYTES)
     try:
         if args.file is not None:
             if not args.file.is_file():
                 sys.stderr.write(f"mail2hook: input file not found: {args.file}\n")
                 return EXIT_DATAERR
-            raw_bytes = args.file.read_bytes()
+            with args.file.open("rb") as f:
+                raw_bytes = f.read(MAX_MESSAGE_BYTES + 1)
         else:
-            raw_bytes = sys.stdin.buffer.read()
+            raw_bytes = sys.stdin.buffer.read(MAX_MESSAGE_BYTES + 1)
     except Exception as err:
         sys.stderr.write(f"mail2hook: failed to read email data: {err}\n")
         return EXIT_DATAERR
 
+    if len(raw_bytes) > MAX_MESSAGE_BYTES:
+        sys.stderr.write(
+            f"mail2hook: message size exceeds maximum limit of {MAX_MESSAGE_BYTES} bytes\n"
+        )
+        return EXIT_DATAERR
+
+    if args.file is None:
+        raw_bytes = _normalize_sendmail_input(raw_bytes, ignore_dots=_ignore_dots_enabled(args))
+
     # 3. Parse email
+    fallback_sender = _build_fallback_sender(args)
     try:
-        msg = parse_email(raw_bytes, max_body_chars=config.max_body_chars)
+        msg = parse_email(
+            raw_bytes,
+            max_body_chars=config.max_body_chars,
+            fallback_sender=fallback_sender,
+        )
     except ParseError as err:
         sys.stderr.write(f"mail2hook: unparseable email data: {err}\n")
         return EXIT_DATAERR
@@ -317,6 +368,8 @@ def run(argv: list[str] | None = None) -> int:
         return EXIT_TEMPFAIL
     except DiscordPermanentError as err:
         sys.stderr.write(f"mail2hook: permanent failure sending to Discord: {err}\n")
+        if err.status_code in (401, 403, 404):
+            return EXIT_CONFIG
         return EXIT_DATAERR
     except Exception as err:
         sys.stderr.write(f"mail2hook: unexpected error sending to Discord: {err}\n")

@@ -5,10 +5,13 @@ from __future__ import annotations
 import email
 import html
 import re
+import socket
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from email import policy
 from email.message import EmailMessage
 from html.parser import HTMLParser
+from pathlib import Path
 
 
 class ParseError(Exception):
@@ -178,18 +181,18 @@ def format_unattended_upgrades_body(body: str, max_chars: int) -> str:
     return truncate_text(body, max_chars)
 
 
+_SUBJECT_FAILURE_RE = re.compile(
+    r"(?<!\bno\s)(?<!\b0\s)\b(?:fail(?:ed|ure|ures)?|errors?|critical|broken|fatal|alert)\b",
+    re.IGNORECASE,
+)
+_SUBJECT_SUCCESS_RE = re.compile(r"\bsuccess(?:ful|fully)?\b", re.IGNORECASE)
+
+
 def detect_status(subject: str, body: str) -> str:
     """Determine message status (success, failure, or info) from subject and body."""
-    sub_lower = subject.lower()
     body_lower = body.lower()
 
-    # Explicit failure indicators
-    if any(
-        term in sub_lower
-        for term in ("fail", "failure", "error", "critical", "broken", "fatal", "alert")
-    ):
-        return "failure"
-
+    # Check explicit unattended-upgrades body outcomes first
     if (
         "unattended upgrade result: some errors" in body_lower
         or "packages that failed" in body_lower
@@ -197,44 +200,97 @@ def detect_status(subject: str, body: str) -> str:
     ):
         return "failure"
 
-    # Explicit success indicators
-    if "success" in sub_lower or "all upgrades installed" in body_lower:
+    if _SUBJECT_FAILURE_RE.search(subject):
+        return "failure"
+
+    if _SUBJECT_SUCCESS_RE.search(subject) or "all upgrades installed" in body_lower:
         return "success"
 
     return "info"
 
 
-_HOSTNAME_REGEX = re.compile(
-    r"\b(?:for|on|at|host:?)\s+([a-zA-Z0-9][-a-zA-Z0-9]*(?:\.[a-zA-Z0-9][-a-zA-Z0-9]*)*)",
+# Match hostnames after specific system prefixes, or user@host patterns in subjects
+_HOSTNAME_USER_AT_RE = re.compile(
+    r"\b(?:for\s+)?[a-zA-Z0-9_.+-]+@([a-zA-Z0-9][-a-zA-Z0-9]*(?:\.[a-zA-Z0-9][-a-zA-Z0-9]*)*)",
+    re.IGNORECASE,
+)
+_HOSTNAME_RESULT_RE = re.compile(
+    r"\b(?:result\s+for|upgrades?\s+for|run\s+on|host:?)\s+"
+    r"([a-zA-Z0-9][-a-zA-Z0-9]*(?:\.[a-zA-Z0-9][-a-zA-Z0-9]*)*)",
+    re.IGNORECASE,
+)
+_HOSTNAME_FOR_FQDN_RE = re.compile(
+    r"\b(?:for|on|at)\s+([a-zA-Z0-9][-a-zA-Z0-9]*(?:\.[a-zA-Z0-9][-a-zA-Z0-9]*)+)",
     re.IGNORECASE,
 )
 
 _IGNORED_HOST_WORDS = frozenset(
-    {"all", "the", "a", "an", "root", "job", "cron", "upgrades", "upgrade", "result", "mail"}
+    {
+        "all",
+        "the",
+        "a",
+        "an",
+        "root",
+        "job",
+        "cron",
+        "upgrades",
+        "upgrade",
+        "result",
+        "mail",
+        "today",
+        "yesterday",
+        "tomorrow",
+        "monday",
+        "tuesday",
+        "wednesday",
+        "thursday",
+        "friday",
+        "saturday",
+        "sunday",
+        "night",
+        "morning",
+        "daily",
+        "weekly",
+        "monthly",
+        "line",
+        "port",
+        "server",
+        "system",
+        "localhost",
+        "localdomain",
+    }
 )
+
+
+def _clean_hostname(value: str) -> str:
+    """Strip characters that cannot appear in a valid hostname or would break Discord markdown."""
+    cleaned = re.sub(r"[^a-zA-Z0-9._-]", "", value.strip().rstrip(":.,"))
+    return cleaned
 
 
 def extract_hostname(subject: str, sender: str, fallback_to_local: bool = False) -> str | None:
     """Try to infer the host name from the subject or sender, optionally falling back to local."""
-    # Check subject like 'unattended-upgrades result for ubuntu24: SUCCESS'
-    match = _HOSTNAME_REGEX.search(subject)
-    if match:
-        candidate = match.group(1).rstrip(":.,")
-        if candidate.lower() not in _IGNORED_HOST_WORDS:
-            return candidate
+    for regex in (_HOSTNAME_RESULT_RE, _HOSTNAME_USER_AT_RE, _HOSTNAME_FOR_FQDN_RE):
+        match = regex.search(subject)
+        if match:
+            candidate = _clean_hostname(match.group(1))
+            if candidate and candidate.lower() not in _IGNORED_HOST_WORDS:
+                return candidate
 
     # Check sender domain e.g. root@ubuntu24 or root@server01.example.com
     if "@" in sender:
-        domain = sender.split("@")[-1].strip(">").strip()
-        if domain and domain.lower() not in ("localhost", "localdomain"):
+        domain = _clean_hostname(sender.split("@")[-1].strip(">").strip())
+        if domain and domain.lower() not in _IGNORED_HOST_WORDS:
             return domain
 
     if fallback_to_local:
         try:
-            import socket
-
-            local_host = socket.gethostname()
-            if local_host and local_host.lower() not in ("localhost", "localhost.localdomain"):
+            local_host = _clean_hostname(socket.gethostname())
+            if local_host and local_host.lower() not in (
+                "localhost",
+                "localhost.localdomain",
+                "localdomain",
+            ):
                 return local_host
         except Exception:
             pass
@@ -250,9 +306,23 @@ _REBOOT_REQUIRED_REGEX = re.compile(
     re.IGNORECASE,
 )
 
+DEFAULT_REBOOT_FLAG_PATHS: tuple[Path, ...] = (
+    Path("/run/reboot-required"),
+    Path("/var/run/reboot-required"),
+)
+DEFAULT_REBOOT_PKGS_PATHS: tuple[Path, ...] = (
+    Path("/run/reboot-required.pkgs"),
+    Path("/var/run/reboot-required.pkgs"),
+)
+
 
 def check_reboot_required(
-    subject: str, body: str, check_system: bool = True
+    subject: str,
+    body: str,
+    check_system: bool = True,
+    *,
+    reboot_flag_paths: Sequence[Path] = DEFAULT_REBOOT_FLAG_PATHS,
+    reboot_pkgs_paths: Sequence[Path] = DEFAULT_REBOOT_PKGS_PATHS,
 ) -> tuple[bool, list[str]]:
     """Determine whether a reboot is required based on email contents or local system state."""
     text = f"{subject}\n{body}"
@@ -262,20 +332,15 @@ def check_reboot_required(
     system_indicates_reboot = False
     if check_system:
         try:
-            from pathlib import Path
-
-            for path in (Path("/run/reboot-required"), Path("/var/run/reboot-required")):
+            for path in reboot_flag_paths:
                 if path.is_file():
                     system_indicates_reboot = True
                     break
 
-            for pkg_file in (
-                Path("/run/reboot-required.pkgs"),
-                Path("/var/run/reboot-required.pkgs"),
-            ):
+            for pkg_file in reboot_pkgs_paths:
                 if pkg_file.is_file():
                     system_pkgs = [
-                        p.strip()
+                        re.sub(r"[`\r\n]", "", p.strip())
                         for p in pkg_file.read_text(encoding="utf-8", errors="replace").splitlines()
                         if p.strip()
                     ]
@@ -286,7 +351,13 @@ def check_reboot_required(
     return (email_indicates_reboot or system_indicates_reboot), system_pkgs
 
 
-def parse_email(raw_bytes: bytes, max_body_chars: int = 1500) -> ParsedMessage:
+def parse_email(
+    raw_bytes: bytes,
+    max_body_chars: int = 1500,
+    *,
+    fallback_sender: str | None = None,
+    check_system_reboot: bool = True,
+) -> ParsedMessage:
     """Parse raw email bytes into a structured ParsedMessage."""
     if not raw_bytes or not raw_bytes.strip():
         raise ParseError("Cannot parse empty email input")
@@ -296,7 +367,14 @@ def parse_email(raw_bytes: bytes, max_body_chars: int = 1500) -> ParsedMessage:
     except Exception as err:
         raise ParseError(f"Malformed email message: {err}") from err
 
-    sender = str(msg.get("From", "(unknown sender)"))
+    raw_from = msg.get("From")
+    if raw_from and str(raw_from).strip():
+        sender = str(raw_from).strip()
+    elif fallback_sender and fallback_sender.strip():
+        sender = fallback_sender.strip()
+    else:
+        sender = "(unknown sender)"
+
     subject = str(msg.get("Subject", "(no subject)"))
     date = str(msg.get("Date", ""))
 
@@ -311,7 +389,7 @@ def parse_email(raw_bytes: bytes, max_body_chars: int = 1500) -> ParsedMessage:
     status = detect_status(subject=subject, body=raw_body)
     hostname = extract_hostname(subject=subject, sender=sender, fallback_to_local=True)
     reboot_required, reboot_packages = check_reboot_required(
-        subject=subject, body=raw_body, check_system=True
+        subject=subject, body=raw_body, check_system=check_system_reboot
     )
 
     return ParsedMessage(

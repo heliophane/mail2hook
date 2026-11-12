@@ -112,7 +112,7 @@ Edit `/etc/mail2hook/env` (`sudo nano /etc/mail2hook/env`):
 DISCORD_WEBHOOK_URL=https://discord.com/api/webhooks/YOUR_WEBHOOK_ID/YOUR_WEBHOOK_TOKEN
 
 # Optional: Friendly server name shown in Discord (defaults to system hostname)
-# Examples: web01, prod-db, bookstack
+# Examples: web01, prod-db, server01
 SERVER_NAME=my-server-name
 ```
 

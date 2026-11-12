@@ -4,10 +4,14 @@ from __future__ import annotations
 
 import json
 import logging
+import platform
+import re
+import socket
 import time
 import urllib.error
 import urllib.request
 from email.utils import parseaddr
+from pathlib import Path
 from typing import Any
 
 from mail2hook import __version__
@@ -38,6 +42,15 @@ class DiscordTemporaryError(DiscordError):
 
 class DiscordPermanentError(DiscordError):
     """Permanent failure (e.g. invalid payload 400, deleted webhook 404) -> exit 65/78."""
+
+    def __init__(self, message: str, *, status_code: int | None = None) -> None:
+        super().__init__(message)
+        self.status_code = status_code
+
+
+def _sanitize_inline_code(value: str) -> str:
+    """Remove backticks and newlines so untrusted values cannot break Discord code spans."""
+    return re.sub(r"[`\r\n]+", "", value).strip()
 
 
 def redact_webhook_url(url: str) -> str:
@@ -83,7 +96,8 @@ def get_log_reminder(
     """Generate log inspection instructions and shell commands."""
     sub_lower = subject.lower()
     body_lower = body.lower()
-    host_display = f" on `{hostname}`" if hostname else ""
+    safe_host = _sanitize_inline_code(hostname) if hostname else ""
+    host_display = f" on `{safe_host}`" if safe_host else ""
 
     reboot_hint = "\n\nReboot server:\n```bash\nsudo reboot\n```" if reboot_required else ""
 
@@ -110,9 +124,6 @@ def get_log_reminder(
 
 def get_os_info() -> str | None:
     """Detect local OS name and major/minor version (e.g. 'Ubuntu 24.04', 'Debian 12')."""
-    import platform
-    from pathlib import Path
-
     # 1. Try platform.freedesktop_os_release (Python 3.10+)
     try:
         if hasattr(platform, "freedesktop_os_release"):
@@ -151,13 +162,11 @@ def get_os_info() -> str | None:
 def get_effective_hostname(msg: ParsedMessage, config: Config) -> str | None:
     """Determine the most accurate hostname: config override > parsed message > local socket."""
     if config.server_name:
-        return config.server_name
+        return _sanitize_inline_code(config.server_name) or None
     if msg.hostname:
-        return msg.hostname
+        return _sanitize_inline_code(msg.hostname) or None
     try:
-        import socket
-
-        local_host = socket.gethostname()
+        local_host = _sanitize_inline_code(socket.gethostname())
         if local_host and local_host.lower() not in ("localhost", "localhost.localdomain"):
             return local_host
     except Exception:
@@ -177,7 +186,8 @@ def build_payload(msg: ParsedMessage, config: Config) -> dict[str, Any]:
     desc = truncate_text(msg.body, max_desc) if msg.body else "(no content)"
 
     hostname = get_effective_hostname(msg, config)
-    os_info = get_os_info()
+    os_info_raw = get_os_info()
+    os_info = _sanitize_inline_code(os_info_raw) if os_info_raw else None
 
     fields: list[dict[str, Any]] = []
 
@@ -203,10 +213,13 @@ def build_payload(msg: ParsedMessage, config: Config) -> dict[str, Any]:
     is_upgrade = "unattended" in msg.subject.lower() or "unattended" in msg.body.lower()
     if msg.reboot_required or is_upgrade:
         if msg.reboot_required:
-            if msg.reboot_packages:
-                pkgs_preview = ", ".join(msg.reboot_packages[:2])
-                if len(msg.reboot_packages) > 2:
-                    pkgs_preview += f" (+{len(msg.reboot_packages) - 2} more)"
+            safe_pkgs = [
+                _sanitize_inline_code(p) for p in msg.reboot_packages if _sanitize_inline_code(p)
+            ]
+            if safe_pkgs:
+                pkgs_preview = ", ".join(safe_pkgs[:2])
+                if len(safe_pkgs) > 2:
+                    pkgs_preview += f" (+{len(safe_pkgs) - 2} more)"
                 reboot_value = f"⚠️ **Required** (`{pkgs_preview}`)"
             else:
                 reboot_value = "⚠️ **Required**"
@@ -363,7 +376,7 @@ def post_to_discord(
                     err_msg += f": {details[:200]}"
             except Exception:
                 pass
-            raise DiscordPermanentError(err_msg) from http_err
+            raise DiscordPermanentError(err_msg, status_code=status_code) from http_err
 
         except (urllib.error.URLError, TimeoutError, OSError) as net_err:
             # Network or connection errors

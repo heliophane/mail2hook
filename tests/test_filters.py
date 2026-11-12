@@ -35,6 +35,11 @@ def test_matches_sender_domain() -> None:
 def test_matches_sender_username() -> None:
     assert matches_sender("root@server01.example.com", ["root"]) is True
     assert matches_sender("daemon@server01.example.com", ["root"]) is False
+    # Display name match (e.g. Unattended-Upgrade::Sender "unattended-upgrades")
+    assert (
+        matches_sender("unattended-upgrades <root@server01.example.com>", ["unattended-upgrades"])
+        is True
+    )
 
 
 def test_matches_subject_empty_filter() -> None:

@@ -43,10 +43,13 @@ def test_cli_print_apt_config(capsys: pytest.CaptureFixture[str]) -> None:
 
 
 def test_cli_missing_config(
-    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], tmp_path: Path
 ) -> None:
     monkeypatch.delenv("DISCORD_WEBHOOK_URL", raising=False)
-    # Ensure no default env file is picked up
+    monkeypatch.delenv("DISCORD_WEBHOOK", raising=False)
+    monkeypatch.delenv("WEBHOOK_URL", raising=False)
+    monkeypatch.setattr("mail2hook.config.DEFAULT_SYSTEM_ENV_PATH", tmp_path / "no_system_env")
+    monkeypatch.chdir(tmp_path)
     exit_code = run(["--dry-run"])
     assert exit_code == EXIT_CONFIG
     captured = capsys.readouterr()
@@ -147,12 +150,18 @@ def test_cli_permanent_failure(
     fixture_path = str(FIXTURES_DIR / "unattended_upgrades_success.eml")
 
     with patch("mail2hook.cli.post_to_discord") as mock_post:
-        mock_post.side_effect = DiscordPermanentError("404 Not Found")
+        mock_post.side_effect = DiscordPermanentError("400 Bad Request", status_code=400)
         exit_code = run(["--file", fixture_path])
 
     assert exit_code == EXIT_DATAERR
     captured = capsys.readouterr()
     assert "permanent failure sending to Discord" in captured.err
+
+    with patch("mail2hook.cli.post_to_discord") as mock_post:
+        mock_post.side_effect = DiscordPermanentError("404 Not Found", status_code=404)
+        exit_code_404 = run(["--file", fixture_path])
+
+    assert exit_code_404 == EXIT_CONFIG
 
 
 def test_cli_print_systemd_service(capsys: pytest.CaptureFixture[str]) -> None:
@@ -186,10 +195,45 @@ def test_cli_sendmail_standard_invocation(monkeypatch: pytest.MonkeyPatch) -> No
 
     with patch("mail2hook.cli.post_to_discord") as mock_post:
         # Standard invocation used by unattended-upgrades and cron:
-        exit_code = run(["-t", "-oi", "-f", "root@bookstack", "mail2hook"])
+        exit_code = run(["-t", "-oi", "-f", "root@server01.example.com", "mail2hook"])
 
     assert exit_code == EXIT_OK
     assert mock_post.call_count == 1
+
+
+def test_cli_sendmail_envelope_sender_and_dot_eof(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("DISCORD_WEBHOOK_URL", VALID_WEBHOOK_URL)
+    raw_eml = b"Subject: Cron job output\n\nLine one\n..leading dot\n.\nIgnored after single dot\n"
+    mock_stdin = MagicMock()
+    mock_stdin.buffer = io.BytesIO(raw_eml)
+    monkeypatch.setattr("sys.stdin", mock_stdin)
+
+    with patch("mail2hook.cli.post_to_discord") as mock_post:
+        exit_code = run(["-f", "root@server01.example.com", "-F", "Cron Daemon", "root"])
+
+    assert exit_code == EXIT_OK
+    assert mock_post.call_count == 1
+    payload = mock_post.call_args[0][1]
+    embed = payload["embeds"][0]
+    assert ".leading dot" in embed["description"]
+    assert "Ignored after single dot" not in embed["description"]
+    from_field = next(f for f in embed["fields"] if f["name"] == "From")
+    assert "Cron Daemon (root@server01.example.com)" == from_field["value"]
+
+
+def test_cli_oversized_input(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setenv("DISCORD_WEBHOOK_URL", VALID_WEBHOOK_URL)
+    monkeypatch.setattr("mail2hook.cli.MAX_MESSAGE_BYTES", 32)
+    mock_stdin = MagicMock()
+    mock_stdin.buffer = io.BytesIO(b"Subject: Too large\n\n" + b"A" * 64)
+    monkeypatch.setattr("sys.stdin", mock_stdin)
+
+    exit_code = run([])
+    assert exit_code == EXIT_DATAERR
+    captured = capsys.readouterr()
+    assert "exceeds maximum limit" in captured.err
 
 
 def test_cli_smtp_listen_invalid_port(

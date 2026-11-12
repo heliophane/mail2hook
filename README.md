@@ -222,9 +222,9 @@ mailq
 | Exit Code | Name | Description |
 | --- | --- | --- |
 | `0` | `EX_OK` | Message successfully sent or filtered out. |
-| `65` | `EX_DATAERR` | Unparseable email input or invalid data. |
-| `75` | `EX_TEMPFAIL` | Discord rate limit exhausted, 5xx server error, network timeout (retry later). |
-| `78` | `EX_CONFIG` | Missing or invalid configuration (e.g. invalid webhook URL). |
+| `65` | `EX_DATAERR` | Unparseable email input, oversized message, or rejected payload (`400`). |
+| `75` | `EX_TEMPFAIL` | Discord rate limit exhausted, `5xx` server error, network timeout (retry later). |
+| `78` | `EX_CONFIG` | Missing/invalid configuration or unauthorized/deleted webhook (`401`/`403`/`404`). |
 
 ---
 
