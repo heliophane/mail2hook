@@ -42,9 +42,31 @@ Specifically designed for automated system notifications:
 
 ---
 
-## 2. Installation on Ubuntu 24 / Debian 12
+## 2. Installation (Ubuntu 24/25 & Debian 12/13)
 
-### Step 1: Install in a dedicated virtual environment
+For an in-depth multi-server guide, see [docs/MULTI_SERVER_SETUP.md](docs/MULTI_SERVER_SETUP.md).
+
+### Step 1: Install prerequisites & remove existing MTAs
+
+Install Python virtual environment tools and remove any conflicting Mail Transfer Agents (Postfix, Exim, etc.):
+
+**On Ubuntu 24.04 LTS & 25.04:**
+```bash
+sudo apt update && sudo apt install -y python3 python3-venv git unattended-upgrades
+sudo systemctl stop postfix 2>/dev/null || true
+sudo apt purge postfix bsd-mailx -y
+```
+
+**On Debian 12 & 13:**
+```bash
+sudo apt update && sudo apt install -y python3 python3-venv git unattended-upgrades
+# Debian ships with exim4 by default; purge it to free /usr/sbin/sendmail
+sudo systemctl stop exim4 2>/dev/null || true
+sudo systemctl stop postfix 2>/dev/null || true
+sudo apt purge 'exim4*' postfix bsd-mailx -y
+```
+
+### Step 2: Install in a dedicated virtual environment
 
 ```bash
 sudo mkdir -p /opt/mail2hook /etc/mail2hook
@@ -52,9 +74,13 @@ sudo python3 -m venv /opt/mail2hook/venv
 sudo /opt/mail2hook/venv/bin/pip install --upgrade pip
 sudo /opt/mail2hook/venv/bin/pip install --upgrade git+https://github.com/heliophane/mail2hook.git
 sudo ln -sf /opt/mail2hook/venv/bin/mail2hook /usr/local/bin/mail2hook
+
+# Symlink mail2hook as the system sendmail and mailq binaries
+sudo ln -sf /opt/mail2hook/venv/bin/mail2hook /usr/sbin/sendmail
+sudo ln -sf /opt/mail2hook/venv/bin/mail2hook /usr/bin/mailq
 ```
 
-### Step 2: Configure `/etc/mail2hook/env`
+### Step 3: Configure `/etc/mail2hook/env`
 
 Create and secure the environment configuration:
 
@@ -70,10 +96,10 @@ Edit `/etc/mail2hook/env`:
 DISCORD_WEBHOOK_URL=https://discord.com/api/webhooks/123456789012345678/example-token-placeholder
 
 # Optional: Friendly server name display in Discord (defaults to system hostname)
-# SERVER_NAME=bookstack
+# SERVER_NAME=my-server-name
 
 # Optional: Comma-separated sender addresses or domains to match. If unset, all senders match.
-# FILTER_SENDERS=root@bookstack, unattended-upgrades
+# FILTER_SENDERS=root@my-server, unattended-upgrades
 
 # Optional: Comma-separated subject keywords to match (case-insensitive). If unset, all subjects match.
 # FILTER_SUBJECT_KEYWORDS=unattended-upgrades, apt-listchanges, cron
@@ -87,25 +113,9 @@ DISCORD_WEBHOOK_URL=https://discord.com/api/webhooks/123456789012345678/example-
 
 ---
 
-## 3. Cutting Out Postfix (Recommended)
+## 3. Configure `unattended-upgrades`
 
-In Linux, tools like `unattended-upgrades`, `cron`, and `apt-listchanges` do not talk to an SMTP daemon. They invoke `/usr/sbin/sendmail -t -oi` directly and write raw email to `stdin`.
-
-By replacing `/usr/sbin/sendmail` with `mail2hook`, you can **purge Postfix completely** and eliminate unnecessary memory, open ports, and queue maintenance.
-
-### Purge Postfix and symlink `mail2hook`:
-
-```bash
-# 1. Stop and remove Postfix
-sudo systemctl stop postfix 2>/dev/null || true
-sudo apt purge postfix -y
-
-# 2. Symlink mail2hook as sendmail and mailq
-sudo ln -sf /opt/mail2hook/venv/bin/mail2hook /usr/sbin/sendmail
-sudo ln -sf /opt/mail2hook/venv/bin/mail2hook /usr/bin/mailq
-```
-
-### Configure `unattended-upgrades`:
+In Linux, tools like `unattended-upgrades`, `cron`, and `apt-listchanges` invoke `/usr/sbin/sendmail -t -oi` directly and write raw email to `stdin`. Because `mail2hook` is symlinked to `/usr/sbin/sendmail`, no background mail daemon is needed.
 
 Generate and install the drop-in configuration directly:
 
