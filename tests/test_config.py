@@ -62,6 +62,7 @@ def test_load_config_all_fields() -> None:
         "FILTER_SUBJECT_KEYWORDS": "CRON, Unattended-Upgrades",
         "MAX_BODY_CHARS": "2000",
         "DISCORD_USERNAME": "ServerAlerts",
+        "SERVER_NAME": "bookstack-prod",
     }
     cfg = load_config(environ=environ)
     assert cfg.discord_webhook_url == VALID_WEBHOOK_URL
@@ -69,6 +70,7 @@ def test_load_config_all_fields() -> None:
     assert cfg.filter_subject_keywords == ["cron", "unattended-upgrades"]
     assert cfg.max_body_chars == 2000
     assert cfg.discord_username == "ServerAlerts"
+    assert cfg.server_name == "bookstack-prod"
 
 
 def test_load_config_invalid_max_body_chars() -> None:

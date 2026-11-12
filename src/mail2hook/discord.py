@@ -97,6 +97,63 @@ def get_log_reminder(subject: str, body: str, hostname: str | None, status: str)
     return f"Check system logs{host_display}:\n```bash\nsudo journalctl -xe\n```"
 
 
+def get_os_info() -> str | None:
+    """Detect local OS name and major/minor version (e.g. 'Ubuntu 24.04', 'Debian 12')."""
+    import platform
+    from pathlib import Path
+
+    # 1. Try platform.freedesktop_os_release (Python 3.10+)
+    try:
+        if hasattr(platform, "freedesktop_os_release"):
+            info = platform.freedesktop_os_release()
+            name = info.get("NAME") or info.get("ID", "").capitalize()
+            version = info.get("VERSION_ID")
+            if name and version:
+                return f"{name} {version}"
+            if info.get("PRETTY_NAME"):
+                return info["PRETTY_NAME"]
+    except Exception:
+        pass
+
+    # 2. Try parsing /etc/os-release directly
+    for os_file in (Path("/etc/os-release"), Path("/usr/lib/os-release")):
+        try:
+            if os_file.is_file():
+                data: dict[str, str] = {}
+                for line in os_file.read_text(encoding="utf-8", errors="replace").splitlines():
+                    line = line.strip()
+                    if "=" in line and not line.startswith("#"):
+                        k, v = line.split("=", 1)
+                        data[k.strip()] = v.strip().strip('"').strip("'")
+                name = data.get("NAME") or data.get("ID", "").capitalize()
+                version = data.get("VERSION_ID")
+                if name and version:
+                    return f"{name} {version}"
+                if data.get("PRETTY_NAME"):
+                    return data["PRETTY_NAME"]
+        except Exception:
+            pass
+
+    return None
+
+
+def get_effective_hostname(msg: ParsedMessage, config: Config) -> str | None:
+    """Determine the most accurate hostname: config override > parsed message > local socket."""
+    if config.server_name:
+        return config.server_name
+    if msg.hostname:
+        return msg.hostname
+    try:
+        import socket
+
+        local_host = socket.gethostname()
+        if local_host and local_host.lower() not in ("localhost", "localhost.localdomain"):
+            return local_host
+    except Exception:
+        pass
+    return None
+
+
 def build_payload(msg: ParsedMessage, config: Config) -> dict[str, Any]:
     """Construct the Discord webhook payload dictionary."""
     color = COLOR_INFO
@@ -108,18 +165,30 @@ def build_payload(msg: ParsedMessage, config: Config) -> dict[str, Any]:
     max_desc = min(config.max_body_chars, MAX_DESCRIPTION_CHARS)
     desc = truncate_text(msg.body, max_desc) if msg.body else "(no content)"
 
+    hostname = get_effective_hostname(msg, config)
+    os_info = get_os_info()
+
     fields: list[dict[str, Any]] = []
 
-    if msg.hostname:
+    if hostname:
         fields.append(
             {
                 "name": "Server",
-                "value": f"`{msg.hostname}`",
+                "value": f"`{hostname}`",
                 "inline": True,
             }
         )
 
-    sender_formatted = format_sender(msg.sender, msg.hostname)
+    if os_info:
+        fields.append(
+            {
+                "name": "OS",
+                "value": f"`{os_info}`",
+                "inline": True,
+            }
+        )
+
+    sender_formatted = format_sender(msg.sender, hostname)
     fields.append(
         {
             "name": "From",
@@ -137,7 +206,7 @@ def build_payload(msg: ParsedMessage, config: Config) -> dict[str, Any]:
             }
         )
 
-    log_reminder = get_log_reminder(msg.subject, msg.body, msg.hostname, msg.status)
+    log_reminder = get_log_reminder(msg.subject, msg.body, hostname, msg.status)
     fields.append(
         {
             "name": "Server Logs",
@@ -146,7 +215,9 @@ def build_payload(msg: ParsedMessage, config: Config) -> dict[str, Any]:
         }
     )
 
-    footer_text = f"mail2hook • {msg.hostname}" if msg.hostname else "mail2hook"
+    footer_text = f"mail2hook • {hostname}" if hostname else "mail2hook"
+    if os_info:
+        footer_text = f"{footer_text} ({os_info})"
 
     embed: dict[str, Any] = {
         "title": truncate_text(msg.subject, MAX_TITLE_CHARS),
@@ -156,8 +227,11 @@ def build_payload(msg: ParsedMessage, config: Config) -> dict[str, Any]:
         "footer": {"text": truncate_text(footer_text, 2048)},
     }
 
-    if msg.hostname:
-        embed["author"] = {"name": f"Server: {msg.hostname}"}
+    if hostname:
+        author_text = f"Server: {hostname}"
+        if os_info:
+            author_text += f" • {os_info}"
+        embed["author"] = {"name": author_text}
 
     return {
         "username": config.discord_username,

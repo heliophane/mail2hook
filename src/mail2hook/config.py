@@ -33,6 +33,7 @@ class Config:
     filter_subject_keywords: list[str] = field(default_factory=list)
     max_body_chars: int = DEFAULT_MAX_BODY_CHARS
     discord_username: str = DEFAULT_DISCORD_USERNAME
+    server_name: str | None = None
 
 
 def _parse_comma_list(raw_value: str | None) -> list[str]:
@@ -132,10 +133,14 @@ def load_config(
     filter_senders = _parse_comma_list(env_map.get("FILTER_SENDERS"))
     filter_subject_keywords = _parse_comma_list(env_map.get("FILTER_SUBJECT_KEYWORDS"))
 
+    server_name_raw = env_map.get("SERVER_NAME") or env_map.get("HOSTNAME_OVERRIDE")
+    server_name = server_name_raw.strip() if server_name_raw and server_name_raw.strip() else None
+
     return Config(
         discord_webhook_url=webhook_url,
         filter_senders=filter_senders,
         filter_subject_keywords=filter_subject_keywords,
         max_body_chars=max_body_chars,
         discord_username=discord_username,
+        server_name=server_name,
     )

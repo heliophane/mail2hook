@@ -88,7 +88,7 @@ def test_build_payload_structure_and_limits() -> None:
     assert "Server Logs" in field_names
 
     # Check author
-    assert embed["author"]["name"] == "Server: box01.example.com"
+    assert "Server: box01.example.com" in embed["author"]["name"]
 
     # Check log command in Server Logs field
     log_field = next(f for f in embed["fields"] if f["name"] == "Server Logs")
@@ -96,6 +96,27 @@ def test_build_payload_structure_and_limits() -> None:
 
     # Footer
     assert "box01.example.com" in embed["footer"]["text"]
+
+
+def test_get_effective_hostname() -> None:
+    from mail2hook.discord import get_effective_hostname
+
+    # Config server_name takes highest precedence
+    cfg = Config(discord_webhook_url=FAKE_WEBHOOK_URL, server_name="custom-host")
+    msg = _make_msg(hostname="parsed-host")
+    assert get_effective_hostname(msg, cfg) == "custom-host"
+
+    # Parsed msg hostname is second
+    cfg_none = Config(discord_webhook_url=FAKE_WEBHOOK_URL, server_name=None)
+    assert get_effective_hostname(msg, cfg_none) == "parsed-host"
+
+
+def test_get_os_info() -> None:
+    from mail2hook.discord import get_os_info
+
+    # Should run safely without error on any OS (returns str or None)
+    os_info = get_os_info()
+    assert os_info is None or isinstance(os_info, str)
 
 
 def test_format_sender() -> None:
