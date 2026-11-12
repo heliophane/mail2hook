@@ -20,13 +20,14 @@ def matches_sender(sender_header: str, filter_senders: list[str]) -> bool:
     - Exact email match: 'user@example.com'
     - Domain match with leading '@': '@example.com'
     - Bare domain match: 'example.com' (matches user@example.com and user@sub.example.com)
-    - Username match: 'root'
+    - Username or display name match: 'root', 'unattended-upgrades'
     """
     if not filter_senders:
         return True
 
-    # Parse address part from 'Display Name <email@domain>'
-    _, email_addr = parseaddr(sender_header)
+    # Parse display name and address part from 'Display Name <email@domain>'
+    display_name, email_addr = parseaddr(sender_header)
+    name_clean = display_name.strip().lower()
     email_clean = (email_addr or sender_header).strip().lower()
 
     # Extract user and domain components
@@ -37,8 +38,8 @@ def matches_sender(sender_header: str, filter_senders: list[str]) -> bool:
         if not pattern:
             continue
 
-        # Exact match
-        if pattern == email_clean:
+        # Exact match on email or display name
+        if pattern == email_clean or (name_clean and pattern == name_clean):
             return True
 
         # Domain pattern starting with '@'

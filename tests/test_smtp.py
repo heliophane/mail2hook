@@ -28,18 +28,23 @@ def test_smtp_server_complete_flow(test_config: Config) -> None:
 
     async def _test() -> None:
         stop_event = asyncio.Event()
+        port_future: asyncio.Future[int] = asyncio.get_running_loop().create_future()
 
-        # Find a free local port
         server_task = asyncio.create_task(
-            run_smtp_server("127.0.0.1", 25251, test_config, stop_event=stop_event)
+            run_smtp_server(
+                "127.0.0.1",
+                0,
+                test_config,
+                stop_event=stop_event,
+                ready_callback=port_future.set_result,
+            )
         )
 
-        # Allow server to start
-        await asyncio.sleep(0.05)
+        port = await port_future
 
         try:
             with patch("mail2hook.smtp.post_to_discord") as mock_post:
-                reader, writer = await asyncio.open_connection("127.0.0.1", 25251)
+                reader, writer = await asyncio.open_connection("127.0.0.1", port)
 
                 banner = await reader.readline()
                 assert banner.startswith(b"220 ")
@@ -55,7 +60,7 @@ def test_smtp_server_complete_flow(test_config: Config) -> None:
                 ehlo_resp4 = await reader.readline()
                 assert ehlo_resp4.startswith(b"250 ")
 
-                writer.write(b"MAIL FROM:<root@bookstack>\r\n")
+                writer.write(b"MAIL FROM:<root@server01.example.com>\r\n")
                 await writer.drain()
                 mail_resp = await reader.readline()
                 assert mail_resp.startswith(b"250 ")
@@ -72,8 +77,7 @@ def test_smtp_server_complete_flow(test_config: Config) -> None:
 
                 email_body = (
                     b"Subject: unattended-upgrades result: SUCCESS\r\n"
-                    b"From: root <root@bookstack>\r\n"
-                    b"To: root@bookstack\r\n"
+                    b"To: root@server01.example.com\r\n"
                     b"\r\n"
                     b"All upgrades installed successfully.\r\n"
                     b"..\r\n"  # Dot transparency stuffing test
@@ -84,6 +88,12 @@ def test_smtp_server_complete_flow(test_config: Config) -> None:
 
                 done_resp = await reader.readline()
                 assert done_resp.startswith(b"250 ")
+
+                # After DATA completes, envelope state must be reset (DATA without new RCPT fails)
+                writer.write(b"DATA\r\n")
+                await writer.drain()
+                data_err = await reader.readline()
+                assert data_err.startswith(b"503 ")
 
                 writer.write(b"QUIT\r\n")
                 await writer.drain()
@@ -96,7 +106,10 @@ def test_smtp_server_complete_flow(test_config: Config) -> None:
                 assert mock_post.call_count == 1
                 payload = mock_post.call_args[0][1]
                 assert "SUCCESS" in payload["embeds"][0]["title"]
-                assert payload["embeds"][0]["author"]["name"] == "Server: testserver"
+                assert payload["embeds"][0]["author"]["name"].startswith("Server: testserver")
+                # Envelope sender fallback used when From: header was omitted
+                from_field = next(f for f in payload["embeds"][0]["fields"] if f["name"] == "From")
+                assert "root@server01.example.com" in from_field["value"]
         finally:
             stop_event.set()
             await server_task
@@ -109,15 +122,22 @@ def test_smtp_server_commands(test_config: Config) -> None:
 
     async def _test() -> None:
         stop_event = asyncio.Event()
+        port_future: asyncio.Future[int] = asyncio.get_running_loop().create_future()
 
         server_task = asyncio.create_task(
-            run_smtp_server("127.0.0.1", 25252, test_config, stop_event=stop_event)
+            run_smtp_server(
+                "127.0.0.1",
+                0,
+                test_config,
+                stop_event=stop_event,
+                ready_callback=port_future.set_result,
+            )
         )
 
-        await asyncio.sleep(0.05)
+        port = await port_future
 
         try:
-            reader, writer = await asyncio.open_connection("127.0.0.1", 25252)
+            reader, writer = await asyncio.open_connection("127.0.0.1", port)
             await reader.readline()  # banner
 
             # NOOP
@@ -165,16 +185,24 @@ def test_smtp_server_esmtp_params_and_size_limit(
 
     async def _test() -> None:
         stop_event = asyncio.Event()
+        port_future: asyncio.Future[int] = asyncio.get_running_loop().create_future()
+
         server_task = asyncio.create_task(
-            run_smtp_server("127.0.0.1", 25253, test_config, stop_event=stop_event)
+            run_smtp_server(
+                "127.0.0.1",
+                0,
+                test_config,
+                stop_event=stop_event,
+                ready_callback=port_future.set_result,
+            )
         )
-        await asyncio.sleep(0.05)
+        port = await port_future
 
         try:
-            reader, writer = await asyncio.open_connection("127.0.0.1", 25253)
+            reader, writer = await asyncio.open_connection("127.0.0.1", port)
             await reader.readline()  # banner
 
-            writer.write(b"MAIL FROM:<root@bookstack> SIZE=1234 BODY=8BITMIME\r\n")
+            writer.write(b"MAIL FROM:<root@server01.example.com> SIZE=1234 BODY=8BITMIME\r\n")
             await writer.drain()
             assert (await reader.readline()).startswith(b"250 ")
 
@@ -182,7 +210,7 @@ def test_smtp_server_esmtp_params_and_size_limit(
             await writer.drain()
             assert (await reader.readline()).startswith(b"501 ")
 
-            writer.write(b"RCPT TO:<admin@bookstack>\r\n")
+            writer.write(b"RCPT TO:<admin@server01.example.com>\r\n")
             await writer.drain()
             assert (await reader.readline()).startswith(b"250 ")
 

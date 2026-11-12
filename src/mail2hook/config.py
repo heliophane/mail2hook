@@ -81,14 +81,16 @@ def _safe_load_dotenv(path: Path) -> dict[str, str]:
 def load_config(
     env_file: Path | str | None = None,
     environ: Mapping[str, str] | None = None,
+    *,
+    load_default_files: bool | None = None,
 ) -> Config:
     """Load and validate configuration from files and environment variables.
 
     Loading order:
     1. If `env_file` is provided, load variables from it.
-    2. Otherwise, if `/etc/mail2hook/env` exists, load from it.
-    3. Load `.env` from the current working directory if present.
-    4. Override with explicit environment variables (environ or os.environ).
+    2. Otherwise, if `load_default_files` is True (default when `environ` is None),
+       load from `/etc/mail2hook/env` and `.env` if present.
+    3. Override with explicit environment variables (`environ` or `os.environ`).
     """
     file_vars: dict[str, str] = {}
     if env_file is not None:
@@ -96,11 +98,15 @@ def load_config(
         if custom_path.is_file():
             file_vars.update(_safe_load_dotenv(custom_path))
     else:
-        if DEFAULT_SYSTEM_ENV_PATH.is_file():
-            file_vars.update(_safe_load_dotenv(DEFAULT_SYSTEM_ENV_PATH))
-        local_env = Path(".env")
-        if local_env.is_file():
-            file_vars.update(_safe_load_dotenv(local_env))
+        should_load_defaults = (
+            (environ is None) if load_default_files is None else load_default_files
+        )
+        if should_load_defaults:
+            if DEFAULT_SYSTEM_ENV_PATH.is_file():
+                file_vars.update(_safe_load_dotenv(DEFAULT_SYSTEM_ENV_PATH))
+            local_env = Path(".env")
+            if local_env.is_file():
+                file_vars.update(_safe_load_dotenv(local_env))
 
     active_environ = os.environ if environ is None else environ
     env_map: dict[str, str] = {**file_vars, **active_environ}

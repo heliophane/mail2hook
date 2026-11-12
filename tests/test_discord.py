@@ -125,9 +125,9 @@ def test_format_sender() -> None:
     # Duplicate name and localpart
     assert format_sender("root <root@ubuntu24>", "ubuntu24") == "root@ubuntu24"
     # Bare local name without @
-    assert format_sender("root", "bookstack") == "root@bookstack"
+    assert format_sender("root", "server01") == "root@server01"
     # @localhost
-    assert format_sender("root@localhost", "bookstack") == "root@bookstack"
+    assert format_sender("root@localhost", "server01") == "root@server01"
     # Distinct name and address
     assert (
         format_sender("Alerts System <alerts@monitor.example.com>", "server01")
@@ -167,12 +167,12 @@ def test_build_payload_reboot_field() -> None:
 
     # 1. Upgrade message with reboot required
     msg_reboot = ParsedMessage(
-        sender="root@bookstack",
-        subject="unattended-upgrades result for bookstack: SUCCESS",
+        sender="root@server01",
+        subject="unattended-upgrades result for server01: SUCCESS",
         date="Wed, 11 Nov 2026 12:00:00 +0000",
         body="All upgrades installed",
         status="success",
-        hostname="bookstack",
+        hostname="server01",
         reboot_required=True,
         reboot_packages=["linux-image-6.8.0-generic"],
     )
@@ -183,17 +183,25 @@ def test_build_payload_reboot_field() -> None:
 
     # 2. Upgrade message without reboot required
     msg_no_reboot = ParsedMessage(
-        sender="root@bookstack",
-        subject="unattended-upgrades result for bookstack: SUCCESS",
+        sender="root@server01",
+        subject="unattended-upgrades result for server01: SUCCESS",
         date="Wed, 11 Nov 2026 12:00:00 +0000",
         body="All upgrades installed",
         status="success",
-        hostname="bookstack",
+        hostname="server01",
         reboot_required=False,
     )
     payload_no = build_payload(msg_no_reboot, config)
     reboot_field_no = next(f for f in payload_no["embeds"][0]["fields"] if f["name"] == "Reboot")
     assert "Not needed" in reboot_field_no["value"]
+
+
+def test_build_payload_sanitizes_backticks() -> None:
+    config = Config(discord_webhook_url=FAKE_WEBHOOK_URL, server_name="host`injected`\nname")
+    msg = _make_msg()
+    payload = build_payload(msg, config)
+    server_field = next(f for f in payload["embeds"][0]["fields"] if f["name"] == "Server")
+    assert server_field["value"] == "`hostinjectedname`"
 
 
 def test_build_payload_colors() -> None:

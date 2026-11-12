@@ -12,6 +12,8 @@ from mail2hook.filters import should_process_message
 from mail2hook.parse import ParseError, parse_email
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
+
     from mail2hook.config import Config
 
 logger = logging.getLogger(__name__)
@@ -75,6 +77,9 @@ class SMTPSession:
                     # Check for end of DATA: single dot on a line
                     if line_bytes in (b".\r\n", b".\n"):
                         data_mode = False
+                        envelope_from = self.envelope_from
+                        self.envelope_from = ""
+                        self.envelope_to.clear()
                         if data_oversized:
                             data_buffer.clear()
                             data_bytes_count = 0
@@ -86,7 +91,7 @@ class SMTPSession:
                         raw_message = b"".join(data_buffer)
                         data_buffer.clear()
                         data_bytes_count = 0
-                        await self._deliver(raw_message)
+                        await self._deliver(raw_message, fallback_sender=envelope_from)
                     else:
                         # RFC 5321 transparency un-stuffing (leading .. becomes .)
                         if line_bytes.startswith(b".."):
@@ -118,6 +123,7 @@ class SMTPSession:
                     # Expected format: MAIL FROM:<address> [ESMTP params]
                     if arg.upper().startswith("FROM:"):
                         self.envelope_from = _extract_envelope_address(arg[5:])
+                        self.envelope_to.clear()
                         await self.write_line("250 2.1.0 Sender OK")
                     else:
                         await self.write_line("501 5.5.4 Syntax error in MAIL FROM parameter")
@@ -171,10 +177,14 @@ class SMTPSession:
             except Exception:
                 pass
 
-    async def _deliver(self, raw_bytes: bytes) -> None:
+    async def _deliver(self, raw_bytes: bytes, fallback_sender: str | None = None) -> None:
         """Parse received email and post to Discord."""
         try:
-            msg = parse_email(raw_bytes, max_body_chars=self.config.max_body_chars)
+            msg = parse_email(
+                raw_bytes,
+                max_body_chars=self.config.max_body_chars,
+                fallback_sender=fallback_sender,
+            )
         except ParseError as err:
             logger.warning("Unparseable email received via SMTP: %s", err)
             await self.write_line(f"554 5.6.0 Message rejected: unparseable email ({err})")
@@ -207,6 +217,7 @@ async def run_smtp_server(
     port: int,
     config: Config,
     stop_event: asyncio.Event | None = None,
+    ready_callback: Callable[[int], None] | None = None,
 ) -> None:
     """Run the SMTP server loop until stopped."""
 
@@ -215,7 +226,12 @@ async def run_smtp_server(
         await session.handle()
 
     server = await asyncio.start_server(client_connected, host, port)
-    logger.info("mail2hook SMTP daemon listening on %s:%d", host, port)
+    bound_port = port
+    if server.sockets:
+        bound_port = int(server.sockets[0].getsockname()[1])
+    logger.info("mail2hook SMTP daemon listening on %s:%d", host, bound_port)
+    if ready_callback is not None:
+        ready_callback(bound_port)
 
     async with server:
         if stop_event is not None:
