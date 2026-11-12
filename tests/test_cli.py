@@ -153,3 +153,64 @@ def test_cli_permanent_failure(
     assert exit_code == EXIT_DATAERR
     captured = capsys.readouterr()
     assert "permanent failure sending to Discord" in captured.err
+
+
+def test_cli_print_systemd_service(capsys: pytest.CaptureFixture[str]) -> None:
+    exit_code = run(["--print-systemd-service"])
+    assert exit_code == EXIT_OK
+    captured = capsys.readouterr()
+    assert "Description=mail2hook SMTP Daemon" in captured.out
+    assert "--smtp-listen" in captured.out
+
+
+def test_cli_mailq_mode(capsys: pytest.CaptureFixture[str]) -> None:
+    exit_code = run(["-bp"])
+    assert exit_code == EXIT_OK
+    captured = capsys.readouterr()
+    assert "Mail queue is empty" in captured.out
+
+
+def test_cli_verify_mode(capsys: pytest.CaptureFixture[str]) -> None:
+    exit_code = run(["-bv", "root@example.com"])
+    assert exit_code == EXIT_OK
+    captured = capsys.readouterr()
+    assert "Recipient OK: deliverable via mail2hook" in captured.out
+
+
+def test_cli_sendmail_standard_invocation(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("DISCORD_WEBHOOK_URL", VALID_WEBHOOK_URL)
+    raw_eml = (FIXTURES_DIR / "unattended_upgrades_success.eml").read_bytes()
+    mock_stdin = MagicMock()
+    mock_stdin.buffer = io.BytesIO(raw_eml)
+    monkeypatch.setattr("sys.stdin", mock_stdin)
+
+    with patch("mail2hook.cli.post_to_discord") as mock_post:
+        # Standard invocation used by unattended-upgrades and cron:
+        exit_code = run(["-t", "-oi", "-f", "root@bookstack", "mail2hook"])
+
+    assert exit_code == EXIT_OK
+    assert mock_post.call_count == 1
+
+
+def test_cli_smtp_listen_invalid_port(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setenv("DISCORD_WEBHOOK_URL", VALID_WEBHOOK_URL)
+    exit_code = run(["--smtp-listen", "127.0.0.1:invalid"])
+    assert exit_code == EXIT_CONFIG
+    captured = capsys.readouterr()
+    assert "invalid port" in captured.err
+
+
+def test_cli_smtp_listen_runs_server(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("DISCORD_WEBHOOK_URL", VALID_WEBHOOK_URL)
+
+    with patch("mail2hook.cli.run_smtp_server") as mock_server:
+        mock_server.return_value = None
+        exit_code = run(["--smtp-listen", "127.0.0.1:2525"])
+
+    assert exit_code == EXIT_OK
+    assert mock_server.call_count == 1
+    args, _kwargs = mock_server.call_args
+    assert args[0] == "127.0.0.1"
+    assert args[1] == 2525

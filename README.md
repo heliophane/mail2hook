@@ -1,11 +1,13 @@
 # mail2hook
 
-[![CI](https://github.com/example/mail2hook/actions/workflows/ci.yml/badge.svg)](https://github.com/example/mail2hook/actions)
+[![CI](https://github.com/heliophane/mail2hook/actions/workflows/ci.yml/badge.svg)](https://github.com/heliophane/mail2hook/actions)
 
-A lightweight Python CLI that receives raw email messages piped directly from Postfix (or any MTA), parses the message, and forwards a formatted summary to a Discord channel via webhook.
+A lightweight Python tool that forwards system emails to a Discord webhook.
 
-Specifically designed for automated system notifications such as:
-- **`unattended-upgrades`** (package installation results, security updates, failure warnings)
+`mail2hook` can **completely replace Postfix** as a drop-in `/usr/sbin/sendmail` binary, run as a zero-dependency lightweight SMTP daemon on `127.0.0.1:25`, or integrate into an existing Postfix installation via pipe transport.
+
+Specifically designed for automated system notifications:
+- **`unattended-upgrades`** (package installation results, security updates, failure warnings, reboot notifications)
 - **`apt-listchanges`** (changelogs and critical package alerts)
 - **`cron`** / systemd timer output
 
@@ -13,30 +15,26 @@ Specifically designed for automated system notifications such as:
 
 ## Features
 
-- **Near-Zero Dependencies**: Uses Python standard library modules (`email`, `urllib.request`, `html.parser`, `argparse`) with only `python-dotenv` for configuration loading.
-- **Postfix Pipe Compatible**: Reads raw email from `sys.stdin.buffer` and exits with standard sysexits exit codes (`0` success/filtered, `75` temporary failure for Postfix retry, `65`/`78` permanent failure).
+- **No Postfix Required**: Acts directly as a `/usr/sbin/sendmail` and `/usr/bin/mailq` drop-in binary. Accepts standard sendmail flags (`-t`, `-oi`, `-i`, `-f`, `-F`, `-bm`, `-bp`, `-bv`, `-B`, `-o...`).
+- **Built-in Async SMTP Daemon**: Optional zero-dependency lightweight RFC 5321 SMTP server (`mail2hook --smtp-listen 127.0.0.1:25`) for services that deliver over TCP sockets.
+- **Zero Heavy Dependencies**: Uses standard Python library modules (`email`, `urllib.request`, `asyncio`, `argparse`) with only `python-dotenv` for configuration loading.
+- **Reboot Detection**: Automatically alerts with `Reboot: ⚠️ Required` (and provides a handy `sudo reboot` hint) when `/var/run/reboot-required` exists or is indicated in package logs.
+- **Multi-Server Friendly**: Automatically detects OS distribution and server hostname, with optional `SERVER_NAME` override.
 - **Strict Security**:
   - Webhook URL token is never logged or printed in clear text.
   - Mentions are neutralized with `"allowed_mentions": {"parse": []}` to prevent email content from triggering `@everyone`, `@here`, or role pings.
 - **Robust Charset & Multipart Handling**: Parses UTF-8, ISO-8859-1/Latin-1, Windows-1252, and multi-part messages; prefers `text/plain` and cleanly strips `text/html`.
-- **Specialized Summary Formatting**: Automatically detects and extracts package lists and error logs from `unattended-upgrades` emails.
-- **Rate Limit & Transient Retry**: Automatically handles Discord HTTP `429` (honoring `Retry-After`) and transient `5xx` / network failures with exponential backoff before signaling Postfix to retry.
+- **Specialized Summary Formatting**: Automatically extracts package lists and error logs from `unattended-upgrades` emails.
+- **Rate Limit & Transient Retry**: Automatically handles Discord HTTP `429` (honoring `Retry-After`) and transient `5xx` / network failures with exponential backoff.
 - **Optional Filtering**: Drop unrelated emails silently by matching sender addresses/domains or subject keywords.
-
----
-
-## Requirements
-
-- Linux server (Debian 12 Bookworm is the primary target; compatible with Ubuntu 22.04+, RHEL/Rocky 9+, etc.)
-- Python 3.11+
 
 ---
 
 ## 1. Creating a Discord Webhook
 
-1. Open Discord and go to **Server Settings** > **Integrations** > **Webhooks** (or open the settings for a specific channel > **Integrations**).
+1. In Discord, go to **Server Settings** > **Integrations** > **Webhooks** (or channel settings > **Integrations**).
 2. Click **New Webhook**.
-3. Choose a name (e.g. `Server Upgrades`) and select the target channel.
+3. Choose a name (e.g. `Server Updates`) and select the target channel.
 4. Click **Copy Webhook URL**. The URL looks like:
    ```text
    https://discord.com/api/webhooks/123456789012345678/example-token-placeholder
@@ -44,215 +42,170 @@ Specifically designed for automated system notifications such as:
 
 ---
 
-## 2. Installation on Debian 12
+## 2. Installation on Ubuntu 24 / Debian 12
 
-### Option A: Dedicated Virtual Environment in `/opt/mail2hook` (Recommended)
-
-1. Create a dedicated system user and group for mail2hook:
-   ```bash
-   sudo useradd --system --no-create-home --user-group --shell /usr/sbin/nologin mail2hook
-   ```
-
-2. Create the directory and python virtual environment:
-   ```bash
-   sudo mkdir -p /opt/mail2hook
-   sudo python3 -m venv /opt/mail2hook/venv
-   sudo /opt/mail2hook/venv/bin/pip install --upgrade pip
-   ```
-
-3. Install `mail2hook`:
-   ```bash
-   # From git repository
-   sudo /opt/mail2hook/venv/bin/pip install git+https://github.com/example/mail2hook.git
-
-   # Or if deploying from source directory
-   sudo /opt/mail2hook/venv/bin/pip install /path/to/mail2hook
-   ```
-
-4. Symlink the executable into `/usr/local/bin`:
-   ```bash
-   sudo ln -sf /opt/mail2hook/venv/bin/mail2hook /usr/local/bin/mail2hook
-   ```
-
-### Option B: Using `pipx`
-
-If `pipx` is installed on your Debian system (`apt install pipx`):
+### Step 1: Install in a dedicated virtual environment
 
 ```bash
-sudo pipx install --global git+https://github.com/example/mail2hook.git
+sudo mkdir -p /opt/mail2hook /etc/mail2hook
+sudo python3 -m venv /opt/mail2hook/venv
+sudo /opt/mail2hook/venv/bin/pip install --upgrade pip
+sudo /opt/mail2hook/venv/bin/pip install --upgrade git+https://github.com/heliophane/mail2hook.git
+sudo ln -sf /opt/mail2hook/venv/bin/mail2hook /usr/local/bin/mail2hook
 ```
 
----
+### Step 2: Configure `/etc/mail2hook/env`
 
-## 3. Configuration (`/etc/mail2hook/env`)
-
-Create the configuration directory and secure environment file:
+Create and secure the environment configuration:
 
 ```bash
-sudo mkdir -p /etc/mail2hook
 sudo touch /etc/mail2hook/env
-sudo chown root:mail2hook /etc/mail2hook/env
-sudo chmod 0640 /etc/mail2hook/env
+sudo chmod 0600 /etc/mail2hook/env
 ```
 
-Edit `/etc/mail2hook/env` with your settings:
+Edit `/etc/mail2hook/env`:
 
 ```ini
 # Required: Discord webhook URL
 DISCORD_WEBHOOK_URL=https://discord.com/api/webhooks/123456789012345678/example-token-placeholder
 
+# Optional: Friendly server name display in Discord (defaults to system hostname)
+# SERVER_NAME=bookstack
+
 # Optional: Comma-separated sender addresses or domains to match. If unset, all senders match.
-FILTER_SENDERS=root@server01.example.com, unattended-upgrades@example.com
+# FILTER_SENDERS=root@bookstack, unattended-upgrades
 
 # Optional: Comma-separated subject keywords to match (case-insensitive). If unset, all subjects match.
-FILTER_SUBJECT_KEYWORDS=unattended-upgrades, apt-listchanges, cron
+# FILTER_SUBJECT_KEYWORDS=unattended-upgrades, apt-listchanges, cron
 
 # Optional: Maximum body characters to include in Discord excerpt (default: 1500)
-MAX_BODY_CHARS=1500
+# MAX_BODY_CHARS=1500
 
 # Optional: Bot display name in Discord (default: mail2hook)
-DISCORD_USERNAME=mail2hook
+# DISCORD_USERNAME=mail2hook
 ```
 
 ---
 
-## 4. Postfix Configuration
+## 3. Cutting Out Postfix (Recommended)
 
-Postfix can deliver email to `mail2hook` using either a dedicated `pipe` transport (recommended for security) or an alias.
+In Linux, tools like `unattended-upgrades`, `cron`, and `apt-listchanges` do not talk to an SMTP daemon. They invoke `/usr/sbin/sendmail -t -oi` directly and write raw email to `stdin`.
 
-### Method A: Dedicated `pipe` Transport in `master.cf` (Recommended)
+By replacing `/usr/sbin/sendmail` with `mail2hook`, you can **purge Postfix completely** and eliminate unnecessary memory, open ports, and queue maintenance.
 
-This method ensures the process runs strictly as the unprivileged `mail2hook` user.
+### Purge Postfix and symlink `mail2hook`:
+
+```bash
+# 1. Stop and remove Postfix
+sudo systemctl stop postfix 2>/dev/null || true
+sudo apt purge postfix -y
+
+# 2. Symlink mail2hook as sendmail and mailq
+sudo ln -sf /opt/mail2hook/venv/bin/mail2hook /usr/sbin/sendmail
+sudo ln -sf /opt/mail2hook/venv/bin/mail2hook /usr/bin/mailq
+```
+
+### Configure `unattended-upgrades`:
+
+Generate and install the drop-in configuration directly:
+
+```bash
+mail2hook --print-apt-config | sudo tee /etc/apt/apt.conf.d/52mail2hook
+```
+
+*(Using a dedicated `52mail2hook` drop-in file avoids modifying `/etc/apt/apt.conf.d/50unattended-upgrades`, preventing dpkg configuration merge prompts during future Debian/Ubuntu package upgrades).*
+
+---
+
+## 4. Alternative: Built-in SMTP Daemon (`127.0.0.1:25`)
+
+If you have applications on your server that connect to `localhost:25` over TCP rather than invoking `sendmail`, you can run `mail2hook` as a systemd SMTP service without needing Postfix.
+
+1. Generate and install the systemd service unit:
+   ```bash
+   mail2hook --print-systemd-service | sudo tee /etc/systemd/system/mail2hook.service
+   ```
+
+2. Reload systemd, enable, and start the service:
+   ```bash
+   sudo systemctl daemon-reload
+   sudo systemctl enable --now mail2hook.service
+   ```
+
+3. Check service status:
+   ```bash
+   sudo systemctl status mail2hook.service
+   ```
+
+---
+
+## 5. Alternative: Postfix Integration (If keeping Postfix)
+
+If your server already uses Postfix for other mail routing, configure Postfix to pipe messages to `mail2hook`:
 
 1. Add the transport definition to `/etc/postfix/master.cf`:
    ```text
    mail2hook unix  -       n       n       -       -       pipe
-     flags=FR user=mail2hook argv=/usr/local/bin/mail2hook
+     flags=FR user=nobody argv=/usr/local/bin/mail2hook
    ```
 
 2. Configure a transport map in `/etc/postfix/transport`:
    ```text
-   mail2hook@example.com    mail2hook:
+   mail2hook@localhost    mail2hook:
    ```
-   *(Replace `example.com` with your server's domain or hostname)*
 
-3. Compile the transport database and configure Postfix:
+3. Compile the transport database and reload Postfix:
    ```bash
    sudo postmap /etc/postfix/transport
    sudo postconf -e "transport_maps = hash:/etc/postfix/transport"
    sudo systemctl reload postfix
    ```
 
-### Method B: Alias in `/etc/aliases`
-
-Alternatively, add an alias to `/etc/aliases`:
-
-```text
-mail2hook: "|/usr/local/bin/mail2hook"
-```
-
-Then rebuild the alias database:
-```bash
-sudo newaliases
-```
-
-*(Note: Postfix executes aliases using the default pipe user configured in `default_privs`, typically `nobody`.)*
-
 ---
 
-## 5. Unattended-Upgrades Configuration
+## 6. Testing & Verification
 
-To forward automated update reports to Discord, you can automatically install the recommended drop-in configuration using `mail2hook`:
-
-### Option A: Install Modular Drop-in Configuration (Recommended)
-
-Generate and install the drop-in configuration directly with one command:
+### Test sendmail drop-in directly:
 
 ```bash
-mail2hook --print-apt-config | sudo tee /etc/apt/apt.conf.d/52mail2hook
+printf "Subject: unattended-upgrades result for server: SUCCESS\nFrom: root <root@example.com>\n\nAll upgrades installed successfully.\nPackages that were upgraded:\n libssl3 openssl\n" | sendmail -t -oi root
 ```
 
-This creates `/etc/apt/apt.conf.d/52mail2hook`:
-```apt
-// /etc/apt/apt.conf.d/52mail2hook
-// Default unattended-upgrades configuration for mail2hook
-
-APT::Periodic::Update-Package-Lists "1";
-APT::Periodic::Unattended-Upgrade "1";
-APT::Periodic::AutocleanInterval "7";
-
-// Send reports to mail2hook
-Unattended-Upgrade::Mail "mail2hook";
-
-// "always" sends Discord notifications for every run; "only-on-error" alerts only on failure
-Unattended-Upgrade::MailReport "always";
-
-Unattended-Upgrade::Sender "unattended-upgrades";
-```
-
-*(Using a dedicated `52mail2hook` drop-in file avoids modifying `/etc/apt/apt.conf.d/50unattended-upgrades`, preventing dpkg configuration merge prompts during future Debian/Ubuntu package upgrades).*
-
-### Option B: Edit `/etc/apt/apt.conf.d/50unattended-upgrades` Manually
-
-Alternatively, edit `/etc/apt/apt.conf.d/50unattended-upgrades` directly:
-
-```apt
-Unattended-Upgrade::Mail "mail2hook";
-Unattended-Upgrade::MailReport "always";
-```
-
----
-
-## 6. CLI Usage & Testing
-
-### Testing with a sample email file:
+### Test dry-run output (does not send to Discord):
 
 ```bash
-# Preview what would be sent to Discord (does not make network calls)
-mail2hook --file /path/to/sample.eml --dry-run
-
-# Send a test email file to Discord
-mail2hook --file /path/to/sample.eml
+printf "Subject: Test Notification\nFrom: root <root@example.com>\n\nTest message." | mail2hook --dry-run
 ```
 
-### Testing with stdin pipe:
+### Test live unattended-upgrades run:
 
 ```bash
-cat /path/to/sample.eml | mail2hook
+sudo unattended-upgrades --dry-run --debug
 ```
 
-### Testing live through Postfix `sendmail`:
+### Test mail queue command:
 
 ```bash
-printf "Subject: Test Notification\nFrom: root@server01.example.com\n\nThis is a test notification from mail2hook." | sendmail mail2hook@example.com
+mailq
+# Output: Mail queue is empty
 ```
-
-### Command Flags:
-
-- `--file PATH`, `-f PATH`: Read raw email from a file instead of stdin.
-- `--dry-run`: Parse and format payload, printing JSON to stdout without sending to Discord.
-- `--env-file PATH`: Use a specific environment file instead of default locations.
-- `--print-apt-config`: Print recommended `/etc/apt/apt.conf.d/52mail2hook` configuration and exit.
-- `--version`, `-v`: Display version information and exit.
 
 ---
 
 ## 7. Exit Code Reference
 
-Postfix relies on standard exit codes (`sysexits.h`) to handle delivery status:
+`mail2hook` conforms to standard `sysexits.h` exit codes:
 
-| Exit Code | Name | Description | Postfix Action |
-| --- | --- | --- | --- |
-| `0` | `EX_OK` | Message successfully sent or filtered out | Message accepted; considered delivered. |
-| `65` | `EX_DATAERR` | Unparseable email input or invalid data | Permanent error; message bounced. |
-| `75` | `EX_TEMPFAIL` | Discord rate limit exhausted, 5xx server error, network timeout | Temporary failure; Postfix retries delivery later. |
-| `78` | `EX_CONFIG` | Missing or invalid configuration (e.g. malformed webhook URL) | Permanent error; message bounced with stderr reason. |
+| Exit Code | Name | Description |
+| --- | --- | --- |
+| `0` | `EX_OK` | Message successfully sent or filtered out. |
+| `65` | `EX_DATAERR` | Unparseable email input or invalid data. |
+| `75` | `EX_TEMPFAIL` | Discord rate limit exhausted, 5xx server error, network timeout (retry later). |
+| `78` | `EX_CONFIG` | Missing or invalid configuration (e.g. invalid webhook URL). |
 
 ---
 
-## 8. Development & Testing
-
-Run tests and code formatting locally:
+## 8. Development
 
 ```bash
 # Create venv and install dependencies
