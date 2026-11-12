@@ -1,0 +1,47 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mail2hook"
+version = "0.1.0"
+description = "Forward system upgrade and notification emails to a Discord webhook"
+readme = "README.md"
+requires-python = ">=3.11"
+authors = [
+    { name = "mail2hook maintainers" }
+]
+license = "MIT"
+dependencies = [
+    "python-dotenv>=1.0.0",
+]
+
+[project.scripts]
+mail2hook = "mail2hook.cli:main"
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0.0",
+    "ruff>=0.4.0",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = [
+    "E",   # pycodestyle
+    "F",   # pyflakes
+    "W",   # pycodestyle warnings
+    "I",   # isort
+    "UP",  # pyupgrade
+    "B",   # flake8-bugbear
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
