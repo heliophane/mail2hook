@@ -61,7 +61,14 @@ def _safe_load_dotenv(path: Path) -> dict[str, str]:
     """Safely load variables from a dotenv file, giving a clear message on permission errors."""
     try:
         loaded = dotenv_values(path)
-        return {k: v for k, v in loaded.items() if v is not None}
+        result: dict[str, str] = {}
+        for k, v in loaded.items():
+            if v is not None:
+                result[k] = v
+            elif k and ("discord.com/api/webhooks/" in k or "discordapp.com/api/webhooks/" in k):
+                # The user pasted the bare webhook URL directly without key= prefix
+                result["DISCORD_WEBHOOK_URL"] = k.strip()
+        return result
     except PermissionError as err:
         raise ConfigError(
             f"Permission denied reading configuration file '{path}'. "
@@ -97,7 +104,13 @@ def load_config(
     active_environ = os.environ if environ is None else environ
     env_map: dict[str, str] = {**file_vars, **active_environ}
 
-    webhook_url = validate_webhook_url(env_map.get("DISCORD_WEBHOOK_URL"))
+    # Accept DISCORD_WEBHOOK_URL, or common aliases DISCORD_WEBHOOK / WEBHOOK_URL
+    raw_webhook = (
+        env_map.get("DISCORD_WEBHOOK_URL")
+        or env_map.get("DISCORD_WEBHOOK")
+        or env_map.get("WEBHOOK_URL")
+    )
+    webhook_url = validate_webhook_url(raw_webhook)
 
     max_body_chars_raw = env_map.get("MAX_BODY_CHARS")
     if max_body_chars_raw is not None and max_body_chars_raw.strip():

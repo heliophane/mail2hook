@@ -106,3 +106,18 @@ def test_load_config_permission_error(tmp_path: Path) -> None:
     finally:
         # Restore permissions so pytest cleanup can delete temp dir
         env_file.chmod(0o644)
+
+
+def test_load_config_bare_webhook_url(tmp_path: Path) -> None:
+    env_file = tmp_path / "bare_env"
+    env_file.write_text(f"{VALID_WEBHOOK_URL}\n")
+    cfg = load_config(env_file=env_file, environ={})
+    assert cfg.discord_webhook_url == VALID_WEBHOOK_URL
+
+
+def test_load_config_webhook_alias() -> None:
+    cfg1 = load_config(environ={"WEBHOOK_URL": VALID_WEBHOOK_URL})
+    assert cfg1.discord_webhook_url == VALID_WEBHOOK_URL
+
+    cfg2 = load_config(environ={"DISCORD_WEBHOOK": VALID_WEBHOOK_URL})
+    assert cfg2.discord_webhook_url == VALID_WEBHOOK_URL
