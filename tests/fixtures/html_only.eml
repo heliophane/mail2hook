@@ -1,0 +1,21 @@
+From: "Alerts System" <alerts@monitor.example.com>
+To: admin@example.com
+Subject: [ALERT] High memory usage detected
+Date: Wed, 11 Nov 2026 07:00:00 +0000
+Content-Type: text/html; charset="utf-8"
+Content-Transfer-Encoding: 7bit
+
+<!DOCTYPE html>
+<html>
+<head>
+  <style>body { font-family: sans-serif; }</style>
+</head>
+<body>
+  <h1>System Resource Alert</h1>
+  <p>Server <strong>server01.example.com</strong> has exceeded 90% memory threshold.</p>
+  <div>
+    <p>Current usage: <strong>94.2%</strong></p>
+    <p>Top processes: node (42%), postgres (31%)</p>
+  </div>
+</body>
+</html>

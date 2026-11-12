@@ -1,0 +1,19 @@
+From: root <root@server01.example.com>
+To: root@server01.example.com
+Subject: unattended-upgrades result for server01.example.com: SUCCESS
+Date: Wed, 11 Nov 2026 06:25:02 +0000
+Content-Type: text/plain; charset="utf-8"
+Content-Transfer-Encoding: 8bit
+Message-ID: <20261111062502.12345.qmail@server01.example.com>
+
+Unattended upgrade result: All upgrades installed
+
+Packages that were upgraded:
+ libssl3 openssl curl libcurl4
+
+Package installation log:
+Log started: 2026-11-11  06:25:00
+Preparing to unpack .../libssl3_3.0.15-1~deb12u1_amd64.deb ...
+Unpacking libssl3:amd64 (3.0.15-1~deb12u1) over (3.0.14-1~deb12u1) ...
+Setting up libssl3:amd64 (3.0.15-1~deb12u1) ...
+Log ended: 2026-11-11  06:25:02

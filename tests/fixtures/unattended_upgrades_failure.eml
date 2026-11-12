@@ -1,0 +1,23 @@
+From: unattended-upgrades <root@server01.example.com>
+To: admin@example.com
+Subject: unattended-upgrades result for server01.example.com: FAILURE
+Date: Wed, 11 Nov 2026 06:30:15 +0000
+Content-Type: text/plain; charset="utf-8"
+Content-Transfer-Encoding: 8bit
+
+Unattended upgrade result: Some errors were encountered
+
+Packages that were upgraded:
+ base-files
+
+Packages that failed to upgrade:
+ broken-pkg-example
+
+Package installation log:
+Log started: 2026-11-11  06:30:10
+dpkg: error processing package broken-pkg-example (--configure):
+ subprocess installed post-installation script returned error exit status 1
+Errors were encountered while processing:
+ broken-pkg-example
+E: Sub-process /usr/bin/dpkg returned an error code (1)
+Log ended: 2026-11-11  06:30:14
