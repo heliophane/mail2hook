@@ -93,3 +93,16 @@ def test_load_config_from_file(tmp_path: Path) -> None:
     cfg = load_config(env_file=env_file, environ={})
     assert cfg.discord_username == "FileBot"
     assert cfg.filter_senders == ["cron@example.com"]
+
+
+def test_load_config_permission_error(tmp_path: Path) -> None:
+    env_file = tmp_path / "inaccessible_env"
+    env_file.write_text(f"DISCORD_WEBHOOK_URL={VALID_WEBHOOK_URL}\n")
+    env_file.chmod(0o000)
+
+    try:
+        with pytest.raises(ConfigError, match="Permission denied reading configuration file"):
+            load_config(env_file=env_file, environ={})
+    finally:
+        # Restore permissions so pytest cleanup can delete temp dir
+        env_file.chmod(0o644)

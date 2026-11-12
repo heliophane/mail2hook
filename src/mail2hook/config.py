@@ -57,6 +57,19 @@ def validate_webhook_url(url: str | None) -> str:
     return cleaned
 
 
+def _safe_load_dotenv(path: Path) -> dict[str, str]:
+    """Safely load variables from a dotenv file, giving a clear message on permission errors."""
+    try:
+        loaded = dotenv_values(path)
+        return {k: v for k, v in loaded.items() if v is not None}
+    except PermissionError as err:
+        raise ConfigError(
+            f"Permission denied reading configuration file '{path}'. "
+            f"Ensure the running user has read access "
+            f"(e.g. sudo chown root:<group> {path} && sudo chmod 0640 {path})"
+        ) from err
+
+
 def load_config(
     env_file: Path | str | None = None,
     environ: Mapping[str, str] | None = None,
@@ -73,16 +86,13 @@ def load_config(
     if env_file is not None:
         custom_path = Path(env_file)
         if custom_path.is_file():
-            loaded = dotenv_values(custom_path)
-            file_vars.update({k: v for k, v in loaded.items() if v is not None})
+            file_vars.update(_safe_load_dotenv(custom_path))
     else:
         if DEFAULT_SYSTEM_ENV_PATH.is_file():
-            loaded = dotenv_values(DEFAULT_SYSTEM_ENV_PATH)
-            file_vars.update({k: v for k, v in loaded.items() if v is not None})
+            file_vars.update(_safe_load_dotenv(DEFAULT_SYSTEM_ENV_PATH))
         local_env = Path(".env")
         if local_env.is_file():
-            loaded = dotenv_values(local_env)
-            file_vars.update({k: v for k, v in loaded.items() if v is not None})
+            file_vars.update(_safe_load_dotenv(local_env))
 
     active_environ = os.environ if environ is None else environ
     env_map: dict[str, str] = {**file_vars, **active_environ}
