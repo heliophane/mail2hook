@@ -326,3 +326,32 @@ def test_parse_email_to_header_and_fallback() -> None:
         fallback_to="root",
     )
     assert msg_without_to.to == "root"
+
+
+def test_parse_unattended_upgrades_qp_and_reboot_required() -> None:
+    raw = (
+        b'Content-Type: text/plain; charset="utf-8"\n'
+        b"MIME-Version: 1.0\n"
+        b"Content-Transfer-Encoding: quoted-printable\n"
+        b"Subject: [reboot required] unattended-upgrades result for web01.example.com: SUCCESS\n"
+        b"From: unattended-upgrades\n"
+        b"To: root\n"
+        b"Auto-Submitted: auto-generated\n"
+        b"\n"
+        b"Unattended upgrade result: All upgrades installed\n"
+        b"\n"
+        b"Warning: A reboot is required to complete this upgrade, or a previous one.=\n"
+        b"\n"
+        b"\n"
+        b"Packages that were upgraded:\n"
+        b" libssl3\n"
+        b"\n"
+        b"Package installation log:\n"
+        b"Unpacking libssl3:amd64 (3.0.15-1) over (3.0.14-1) ...\n"
+    )
+    parsed = parse_email(raw, check_system_reboot=False)
+    assert parsed.status == "success"
+    assert parsed.hostname == "web01.example.com"
+    assert parsed.to == "root"
+    assert parsed.reboot_required is True
+    assert "`libssl3`: `3.0.14-1` → `3.0.15-1`" in parsed.body

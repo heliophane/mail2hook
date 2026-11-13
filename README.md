@@ -53,7 +53,7 @@ The installer:
 1. Detects the OS and installs minimal dependencies (`python3`, `ca-certificates`, `curl`, and `unattended-upgrades`).
 2. Installs `/usr/local/bin/mail2hook` and links `/usr/sbin/sendmail` via `update-alternatives` (unless another MTA owns it).
 3. Prompts securely for your Discord webhook URL via `/dev/tty` (hidden input) and writes `/etc/mail2hook/env`.
-4. Configures conservative, nightly **security-only** `unattended-upgrades` (`Automatic-Reboot "false"`).
+4. Configures conservative, nightly **security-only** `unattended-upgrades` (`Mail "root"`, `MailReport "on-change"` so Discord notifies on changes/errors and stays quiet on no-op runs, `Automatic-Reboot "false"`). No `mailx` package is needed because `unattended-upgrades` invokes `/usr/sbin/sendmail` directly.
 5. Sends an end-to-end test message through `sendmail` and reports the result.
 
 ### Supported Operating Systems

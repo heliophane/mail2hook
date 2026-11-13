@@ -45,9 +45,10 @@ APT::Periodic::AutocleanInterval "7";
 Unattended-Upgrade::Mail "root";
 
 // 3. Reporting frequency:
-// - "always": Send a Discord notification on every upgrade run (recommended)
+// - "on-change": Send a Discord notification when upgrades occur or fail (recommended)
+// - "always": Send a Discord notification on every upgrade run, even with zero changes
 // - "only-on-error": Send a Discord notification only when an upgrade fails
-Unattended-Upgrade::MailReport "always";
+Unattended-Upgrade::MailReport "on-change";
 
 // 4. Sender identity for clean email headers
 Unattended-Upgrade::Sender "unattended-upgrades";

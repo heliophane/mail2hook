@@ -813,9 +813,14 @@ EOF
 
 ${origins_block}
 
-// Deliver upgrade notifications to mail2hook via /usr/sbin/sendmail
+// Deliver upgrade notifications to mail2hook via /usr/sbin/sendmail.
+// unattended-upgrades invokes /usr/sbin/sendmail directly (no mailx needed).
 Unattended-Upgrade::Mail "root";
-Unattended-Upgrade::MailReport "always";
+
+// Notify only when packages are upgraded/kept-back/removed or an error occurs,
+// keeping Discord quiet on uneventful zero-change nightly runs.
+// Valid options: "on-change" (recommended), "always", "only-on-error".
+Unattended-Upgrade::MailReport "on-change";
 Unattended-Upgrade::Sender "unattended-upgrades";
 
 // Never reboot automatically; mail2hook reports pending reboots in Discord

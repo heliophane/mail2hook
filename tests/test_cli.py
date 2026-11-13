@@ -39,6 +39,7 @@ def test_cli_print_apt_config(capsys: pytest.CaptureFixture[str]) -> None:
     assert exit_code == EXIT_OK
     captured = capsys.readouterr()
     assert "Unattended-Upgrade::Mail" in captured.out
+    assert 'Unattended-Upgrade::MailReport "on-change";' in captured.out
     assert "52mail2hook" in captured.out
 
 
