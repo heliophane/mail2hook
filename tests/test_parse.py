@@ -7,9 +7,13 @@ from pathlib import Path
 import pytest
 
 from mail2hook.parse import (
+    PackageUpgrade,
     ParseError,
     detect_status,
     extract_hostname,
+    extract_package_versions,
+    extract_upgraded_packages,
+    format_unattended_upgrades_body,
     parse_email,
     strip_html,
     truncate_text,
@@ -60,7 +64,24 @@ def test_parse_unattended_upgrades_success() -> None:
     assert parsed.status == "success"
     assert parsed.hostname == "server01.example.com"
     assert "All upgrades installed" in parsed.body
-    assert "libssl3 openssl curl libcurl4" in parsed.body
+    # Packages are formatted as a vertical list with old -> new versions
+    expected_lines = (
+        "Packages that were upgraded:\n"
+        "• `libssl3`: `3.0.14-1~deb12u1` → `3.0.15-1~deb12u1`\n"
+        "• `openssl`: `3.0.14-1~deb12u1` → `3.0.15-1~deb12u1`\n"
+        "• `curl`: `7.88.1-10+deb12u7` → `7.88.1-10+deb12u8`\n"
+        "• `libcurl4`: `7.88.1-10+deb12u7` → `7.88.1-10+deb12u8`"
+    )
+    assert expected_lines in parsed.body
+    # Ensure "Allowed origins are:" does not falsely trigger "Errors encountered:"
+    assert "Errors encountered:" not in parsed.body
+    assert "Allowed origins are:" not in parsed.body
+    assert parsed.upgraded_packages == [
+        PackageUpgrade("libssl3", "3.0.14-1~deb12u1", "3.0.15-1~deb12u1"),
+        PackageUpgrade("openssl", "3.0.14-1~deb12u1", "3.0.15-1~deb12u1"),
+        PackageUpgrade("curl", "7.88.1-10+deb12u7", "7.88.1-10+deb12u8"),
+        PackageUpgrade("libcurl4", "7.88.1-10+deb12u7", "7.88.1-10+deb12u8"),
+    ]
 
 
 def test_parse_unattended_upgrades_failure() -> None:
@@ -71,8 +92,9 @@ def test_parse_unattended_upgrades_failure() -> None:
     assert parsed.status == "failure"
     assert parsed.hostname == "server01.example.com"
     assert "Some errors were encountered" in parsed.body
-    assert "broken-pkg-example" in parsed.body
-    assert "dpkg: error" in parsed.body.lower() or "errors encountered" in parsed.body.lower()
+    assert "• `base-files`: `12.4+deb12u7` → `12.4+deb12u8`" in parsed.body
+    assert "• `broken-pkg-example`" in parsed.body
+    assert "dpkg: error" in parsed.body.lower() and "errors encountered:" in parsed.body.lower()
 
 
 def test_parse_html_only() -> None:
@@ -198,3 +220,95 @@ def test_check_reboot_required(tmp_path: Path) -> None:
     )
     assert req_sys is True
     assert pkgs_sys == ["linux-image-6.8.0-generic", "libc6"]
+
+
+def test_format_unattended_upgrades_multiline_and_no_false_errors() -> None:
+    body = (
+        "Unattended upgrade result: All upgrades installed\n"
+        "\n"
+        "Packages that were upgraded:\n"
+        " apache2 apache2-bin apache2-data apache2-utils libc-bin libc-dev-bin\n"
+        " libc-devtools libc6 libc6-dev linux-firmware-amd-graphics libgpg-error0\n"
+        "\n"
+        "Package installation log:\n"
+        "Log started: 2026-11-12  22:00:02\n"
+        "Unpacking apache2 (2.4.58-1ubuntu8.5) over (2.4.58-1ubuntu8.4) ...\n"
+        "Unpacking apache2-bin (2.4.58-1ubuntu8.5) over (2.4.58-1ubuntu8.4) ...\n"
+        "Unpacking apache2-data (2.4.58-1ubuntu8.5) over (2.4.58-1ubuntu8.4) ...\n"
+        "Unpacking apache2-utils (2.4.58-1ubuntu8.5) over (2.4.58-1ubuntu8.4) ...\n"
+        "Unpacking libc-bin (2.39-0ubuntu8.4) over (2.39-0ubuntu8.3) ...\n"
+        "Unpacking libc-dev-bin (2.39-0ubuntu8.4) over (2.39-0ubuntu8.3) ...\n"
+        "Unpacking libc-devtools (2.39-0ubuntu8.4) over (2.39-0ubuntu8.3) ...\n"
+        "Unpacking libc6:amd64 (2.39-0ubuntu8.4) over (2.39-0ubuntu8.3) ...\n"
+        "Unpacking libc6-dev:amd64 (2.39-0ubuntu8.4) over (2.39-0ubuntu8.3) ...\n"
+        "Unpacking linux-firmware-amd-graphics (20240318.git3b128b60-0ubuntu2.7) "
+        "over (20240318.git3b128b60-0ubuntu2.6) ...\n"
+        "Unpacking libgpg-error0:amd64 (1.47-3build2) over (1.47-3build1) ...\n"
+        "Log ended: 2026-11-12  22:00:15\n"
+        "\n"
+        "Unattended-upgrades log:\n"
+        "Allowed origins are: o=Ubuntu,a=noble-security, o=UbuntuESMApps,a=noble-apps-security\n"
+    )
+    formatted = format_unattended_upgrades_body(body, max_chars=2000, check_system=False)
+
+    assert "Errors encountered:" not in formatted
+    assert "Allowed origins are:" not in formatted
+    assert (
+        "Packages that were upgraded:\n"
+        "• `apache2`: `2.4.58-1ubuntu8.4` → `2.4.58-1ubuntu8.5`\n"
+        "• `apache2-bin`: `2.4.58-1ubuntu8.4` → `2.4.58-1ubuntu8.5`\n"
+        "• `apache2-data`: `2.4.58-1ubuntu8.4` → `2.4.58-1ubuntu8.5`\n"
+        "• `apache2-utils`: `2.4.58-1ubuntu8.4` → `2.4.58-1ubuntu8.5`\n"
+        "• `libc-bin`: `2.39-0ubuntu8.3` → `2.39-0ubuntu8.4`\n"
+        "• `libc-dev-bin`: `2.39-0ubuntu8.3` → `2.39-0ubuntu8.4`\n"
+        "• `libc-devtools`: `2.39-0ubuntu8.3` → `2.39-0ubuntu8.4`\n"
+        "• `libc6`: `2.39-0ubuntu8.3` → `2.39-0ubuntu8.4`\n"
+        "• `libc6-dev`: `2.39-0ubuntu8.3` → `2.39-0ubuntu8.4`\n"
+        "• `linux-firmware-amd-graphics`: `20240318.git3b128b60-0ubuntu2.6` "
+        "→ `20240318.git3b128b60-0ubuntu2.7`\n"
+        "• `libgpg-error0`: `1.47-3build1` → `1.47-3build2`"
+    ) in formatted
+
+
+def test_extract_versions_from_dpkg_log_fallback(tmp_path: Path) -> None:
+    dpkg_log = tmp_path / "dpkg.log"
+    dpkg_log.write_text(
+        "2026-11-01 06:00:00 upgrade nginx:amd64 1.24.0-1 1.24.0-2\n"
+        "2026-11-12 22:00:05 upgrade nginx:amd64 1.24.0-2 1.24.0-3\n"
+        "2026-11-12 22:00:06 install linux-image-6.8.0-48-generic:amd64 <none> 6.8.0-48.48\n"
+    )
+    body = (
+        "Unattended upgrade result: All upgrades installed\n\n"
+        "Packages that were upgraded:\n"
+        " nginx linux-image-6.8.0-48-generic unknown-pkg\n"
+    )
+    upgrades = extract_upgraded_packages(
+        body,
+        check_system=True,
+        dpkg_log_paths=(dpkg_log,),
+    )
+    assert upgrades == [
+        PackageUpgrade("nginx", "1.24.0-2", "1.24.0-3"),
+        PackageUpgrade("linux-image-6.8.0-48-generic", None, "6.8.0-48.48"),
+        PackageUpgrade("unknown-pkg", None, None),
+    ]
+
+    formatted = format_unattended_upgrades_body(
+        body,
+        max_chars=1500,
+        check_system=True,
+        dpkg_log_paths=(dpkg_log,),
+    )
+    assert "• `nginx`: `1.24.0-2` → `1.24.0-3`" in formatted
+    assert "• `linux-image-6.8.0-48-generic`: → `6.8.0-48.48`" in formatted
+    assert "• `unknown-pkg`" in formatted
+
+
+def test_extract_package_versions_apt_and_new_unpack() -> None:
+    text = (
+        "Unpacking new-dep (1.0.0-1) ...\n"
+        "Inst tzdata [2024a-0ubuntu0.24.04] (2024a-0ubuntu0.24.04.1 Ubuntu:24.04/noble-updates)\n"
+    )
+    versions = extract_package_versions(text)
+    assert versions["new-dep"] == (None, "1.0.0-1")
+    assert versions["tzdata"] == ("2024a-0ubuntu0.24.04", "2024a-0ubuntu0.24.04.1")

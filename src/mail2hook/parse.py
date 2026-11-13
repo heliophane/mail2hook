@@ -18,6 +18,32 @@ class ParseError(Exception):
     """Raised when an email cannot be parsed."""
 
 
+def _sanitize_code_span(value: str) -> str:
+    """Remove backticks and newlines so values are safe inside Discord inline code spans."""
+    return re.sub(r"[`\r\n]+", "", value).strip()
+
+
+@dataclass(frozen=True)
+class PackageUpgrade:
+    """Version transition details for an upgraded or newly installed package."""
+
+    name: str
+    old_version: str | None = None
+    new_version: str | None = None
+
+    def format_line(self) -> str:
+        """Format package entry as a single bulleted line for Discord."""
+        safe_name = _sanitize_code_span(self.name)
+        safe_old = _sanitize_code_span(self.old_version) if self.old_version else None
+        safe_new = _sanitize_code_span(self.new_version) if self.new_version else None
+
+        if safe_old and safe_new:
+            return f"• `{safe_name}`: `{safe_old}` → `{safe_new}`"
+        if safe_new:
+            return f"• `{safe_name}`: → `{safe_new}`"
+        return f"• `{safe_name}`"
+
+
 @dataclass(frozen=True)
 class ParsedMessage:
     """Extracted and normalized email details."""
@@ -30,6 +56,7 @@ class ParsedMessage:
     hostname: str | None = None
     reboot_required: bool = False
     reboot_packages: list[str] = field(default_factory=list)
+    upgraded_packages: list[PackageUpgrade] = field(default_factory=list)
 
 
 class _HTMLTextExtractor(HTMLParser):
@@ -149,36 +176,406 @@ def truncate_text(text: str, max_chars: int) -> str:
     return text[: max_chars - 1].rstrip() + "…"
 
 
-def format_unattended_upgrades_body(body: str, max_chars: int) -> str:
-    """Format unattended-upgrades body: prioritize package summary and errors."""
-    if "Package installation log:" in body:
-        header, _, log_section = body.partition("Package installation log:")
-        header = header.strip()
-        log_section = log_section.strip()
+# dpkg output: "Unpacking libssl3:amd64 (3.0.15-1~deb12u1) over (3.0.14-1~deb12u1) ..."
+_DPKG_UNPACK_OVER_RE = re.compile(
+    r"^\s*Unpacking\s+([^\s:(]+)(?::([^\s(]+))?\s+\(([^)]+)\)\s+over\s+\(([^)]+)\)",
+    re.MULTILINE,
+)
+# dpkg output for newly installed package: "Unpacking linux-image-generic (6.8.0-48.48) ..."
+_DPKG_UNPACK_NEW_RE = re.compile(
+    r"^\s*Unpacking\s+([^\s:(]+)(?::([^\s(]+))?\s+\(([^)]+)\)\s+\.\.\.",
+    re.MULTILINE,
+)
+# /var/log/dpkg.log format: "2026-11-12 22:00:05 upgrade apache2:amd64 2.4.58-1 2.4.58-2"
+_DPKG_LOG_UPGRADE_RE = re.compile(
+    r"^\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2}\s+upgrade\s+([^\s:]+)(?::([^\s]+))?\s+(\S+)\s+(\S+)",
+    re.MULTILINE,
+)
+# /var/log/dpkg.log install format: "2026-11-12 22:00:05 install pkg:amd64 <none> 1.2.3"
+_DPKG_LOG_INSTALL_RE = re.compile(
+    r"^\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2}\s+install\s+([^\s:]+)(?::([^\s]+))?\s+<none>\s+(\S+)",
+    re.MULTILINE,
+)
+# apt output: "Inst apache2 [2.4.58-1ubuntu8.4] (2.4.58-1ubuntu8.5 ...)"
+_APT_INST_UPGRADE_RE = re.compile(
+    r"^\s*Inst\s+([^\s:\[]+)(?::([^\s\[]+))?\s+\[([^\]]+)\]\s+\(([^\s)]+)",
+    re.MULTILINE,
+)
 
-        # If header alone is within limit and fits some log, include key lines from log
-        if len(header) + 30 < max_chars:
-            available_for_log = max_chars - len(header) - 35
-            # Check for error lines in log
-            error_lines = [
-                line
-                for line in log_section.splitlines()
-                if any(
-                    err_term in line.lower()
-                    for err_term in ("error", "failed", "dpkg: error", "e: ")
+_PACKAGE_SECTION_RE = re.compile(r"^(Packages\b[^:]*):\s*(.*)$", re.IGNORECASE)
+
+_DPKG_PROGRESS_PREFIXES = (
+    "preparing to unpack",
+    "unpacking ",
+    "setting up ",
+    "selecting previously unselected",
+    "(reading database",
+    "processing triggers for",
+)
+
+_LOG_ERROR_LINE_RE = re.compile(
+    r"^\s*E:\s+"
+    r"|\bdpkg:\s*error\b"
+    r"|\berrors\s+were\s+encountered\b"
+    r"|\berror\s+processing\b"
+    r"|\berror\s+exit\s+status\b"
+    r"|\berror\s+code\b"
+    r"|\bfailed\b"
+    r"|\bERROR\b",
+    re.IGNORECASE,
+)
+
+DEFAULT_DPKG_LOG_PATHS: tuple[Path, ...] = (
+    Path("/var/log/unattended-upgrades/unattended-upgrades-dpkg.log"),
+    Path("/var/log/dpkg.log"),
+)
+
+
+def _record_version(
+    versions: dict[str, tuple[str | None, str | None]],
+    pkg_base: str,
+    arch: str | None,
+    old_ver: str | None,
+    new_ver: str | None,
+    *,
+    preserve_initial_old: bool = True,
+) -> None:
+    """Store old and new versions keyed by both base package name and arch-qualified name."""
+    keys = [pkg_base]
+    if arch:
+        keys.append(f"{pkg_base}:{arch}")
+    for key in keys:
+        if preserve_initial_old and key in versions:
+            initial_old, _ = versions[key]
+            versions[key] = (initial_old or old_ver, new_ver)
+        else:
+            versions[key] = (old_ver, new_ver)
+
+
+def extract_package_versions(
+    text: str,
+    *,
+    preserve_initial_old: bool = True,
+) -> dict[str, tuple[str | None, str | None]]:
+    """Extract (old_version, new_version) mappings from dpkg/apt logs in text."""
+    versions: dict[str, tuple[str | None, str | None]] = {}
+
+    for match in _DPKG_UNPACK_OVER_RE.finditer(text):
+        pkg_base, arch, new_ver, old_ver = (
+            match.group(1),
+            match.group(2),
+            match.group(3).strip(),
+            match.group(4).strip(),
+        )
+        _record_version(
+            versions,
+            pkg_base,
+            arch,
+            old_ver,
+            new_ver,
+            preserve_initial_old=preserve_initial_old,
+        )
+
+    for match in _DPKG_UNPACK_NEW_RE.finditer(text):
+        pkg_base, arch, new_ver = match.group(1), match.group(2), match.group(3).strip()
+        if pkg_base not in versions:
+            _record_version(
+                versions,
+                pkg_base,
+                arch,
+                None,
+                new_ver,
+                preserve_initial_old=preserve_initial_old,
+            )
+
+    for match in _DPKG_LOG_UPGRADE_RE.finditer(text):
+        pkg_base, arch, old_ver, new_ver = (
+            match.group(1),
+            match.group(2),
+            match.group(3).strip(),
+            match.group(4).strip(),
+        )
+        _record_version(
+            versions,
+            pkg_base,
+            arch,
+            old_ver,
+            new_ver,
+            preserve_initial_old=preserve_initial_old,
+        )
+
+    for match in _DPKG_LOG_INSTALL_RE.finditer(text):
+        pkg_base, arch, new_ver = match.group(1), match.group(2), match.group(3).strip()
+        if pkg_base not in versions:
+            _record_version(
+                versions,
+                pkg_base,
+                arch,
+                None,
+                new_ver,
+                preserve_initial_old=preserve_initial_old,
+            )
+
+    for match in _APT_INST_UPGRADE_RE.finditer(text):
+        pkg_base, arch, old_ver, new_ver = (
+            match.group(1),
+            match.group(2),
+            match.group(3).strip(),
+            match.group(4).strip(),
+        )
+        if pkg_base not in versions:
+            _record_version(
+                versions,
+                pkg_base,
+                arch,
+                old_ver,
+                new_ver,
+                preserve_initial_old=preserve_initial_old,
+            )
+
+    return versions
+
+
+def _read_system_dpkg_versions(
+    dpkg_log_paths: Sequence[Path] = DEFAULT_DPKG_LOG_PATHS,
+) -> dict[str, tuple[str | None, str | None]]:
+    """Read recent package version transitions from local dpkg logs as a fallback."""
+    combined_versions: dict[str, tuple[str | None, str | None]] = {}
+    for path in dpkg_log_paths:
+        try:
+            if not path.is_file():
+                continue
+            with path.open("rb") as f:
+                f.seek(0, 2)
+                size = f.tell()
+                f.seek(max(0, size - 131072))
+                tail_text = f.read().decode("utf-8", errors="replace")
+            file_versions = extract_package_versions(tail_text, preserve_initial_old=False)
+            for k, v in file_versions.items():
+                if k not in combined_versions:
+                    combined_versions[k] = v
+        except Exception:
+            pass
+    return combined_versions
+
+
+def _lookup_package_version(
+    pkg_name: str,
+    versions: dict[str, tuple[str | None, str | None]],
+) -> tuple[str | None, str | None]:
+    """Find (old_version, new_version) for pkg_name, matching with or without :arch."""
+    if pkg_name in versions:
+        return versions[pkg_name]
+    base_name = pkg_name.split(":", 1)[0]
+    if base_name in versions:
+        return versions[base_name]
+    return (None, None)
+
+
+def _split_package_tokens(lines: list[str]) -> list[str]:
+    """Extract clean package names from one or more space/comma-separated package list lines."""
+    pkgs: list[str] = []
+    for line in lines:
+        for raw_token in line.replace(",", " ").split():
+            token = raw_token.strip().lstrip("•*-").strip()
+            if token:
+                pkgs.append(token)
+    return pkgs
+
+
+def _split_unattended_header_and_logs(body: str) -> tuple[str, str]:
+    """Split an unattended-upgrades body into summary header and trailing log sections."""
+    markers = ("Package installation log:", "Unattended-upgrades log:")
+    earliest_idx: int | None = None
+    for marker in markers:
+        idx = body.find(marker)
+        if idx != -1 and (earliest_idx is None or idx < earliest_idx):
+            earliest_idx = idx
+
+    if earliest_idx is not None:
+        return body[:earliest_idx].strip(), body[earliest_idx:].strip()
+    return body.strip(), ""
+
+
+def _extract_error_lines(log_section: str) -> list[str]:
+    """Extract genuine dpkg/apt error lines from log_section without false positives."""
+    if not log_section:
+        return []
+    # Only inspect the Package installation log part if Unattended-upgrades log follows,
+    # unless an explicit ERROR line appears in Unattended-upgrades log.
+    error_lines: list[str] = []
+    for line in log_section.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+        lower = stripped.lower()
+        if lower.startswith(_DPKG_PROGRESS_PREFIXES):
+            continue
+        if lower.startswith("allowed origins are:"):
+            continue
+        if _LOG_ERROR_LINE_RE.search(stripped):
+            error_lines.append(line)
+    return error_lines
+
+
+def extract_upgraded_packages(
+    body: str,
+    *,
+    check_system: bool = False,
+    dpkg_log_paths: Sequence[Path] = DEFAULT_DPKG_LOG_PATHS,
+) -> list[PackageUpgrade]:
+    """Extract the list of upgraded packages and their version transitions from an email body."""
+    versions = extract_package_versions(body)
+    header, _ = _split_unattended_header_and_logs(body)
+
+    upgraded_names: list[str] = []
+    lines = header.splitlines()
+    i = 0
+    while i < len(lines):
+        match = _PACKAGE_SECTION_RE.match(lines[i].strip())
+        if match:
+            section_title = match.group(1).strip()
+            inline_rest = match.group(2).strip()
+            pkg_lines: list[str] = [inline_rest] if inline_rest else []
+            i += 1
+            while i < len(lines):
+                next_stripped = lines[i].strip()
+                if not next_stripped or next_stripped.endswith(":"):
+                    break
+                pkg_lines.append(next_stripped)
+                i += 1
+            if "upgraded" in section_title.lower():
+                upgraded_names.extend(_split_package_tokens(pkg_lines))
+            continue
+        i += 1
+
+    # If no explicit "Packages that were upgraded:" list was present, fall back to unpacked packages
+    if not upgraded_names:
+        seen_bases: set[str] = set()
+        for match in _DPKG_UNPACK_OVER_RE.finditer(body):
+            pkg_base = match.group(1)
+            if pkg_base not in seen_bases:
+                seen_bases.add(pkg_base)
+                upgraded_names.append(pkg_base)
+
+    # Check local system dpkg logs if any package is still missing version info
+    if check_system and any(
+        _lookup_package_version(pkg, versions) == (None, None) for pkg in upgraded_names
+    ):
+        sys_versions = _read_system_dpkg_versions(dpkg_log_paths)
+        for k, v in sys_versions.items():
+            if k not in versions:
+                versions[k] = v
+
+    return [
+        PackageUpgrade(
+            name=pkg,
+            old_version=_lookup_package_version(pkg, versions)[0],
+            new_version=_lookup_package_version(pkg, versions)[1],
+        )
+        for pkg in upgraded_names
+    ]
+
+
+def format_unattended_upgrades_body(
+    body: str,
+    max_chars: int,
+    *,
+    check_system: bool = False,
+    dpkg_log_paths: Sequence[Path] = DEFAULT_DPKG_LOG_PATHS,
+) -> str:
+    """Format unattended-upgrades body with vertical package lists and version transitions."""
+    versions = extract_package_versions(body)
+    header, log_section = _split_unattended_header_and_logs(body)
+
+    # First pass: collect all package tokens in header to see if system log fallback is needed
+    lines = header.splitlines()
+    all_header_pkgs: list[str] = []
+    idx = 0
+    while idx < len(lines):
+        m = _PACKAGE_SECTION_RE.match(lines[idx].strip())
+        if m:
+            inline_rest = m.group(2).strip()
+            sec_lines = [inline_rest] if inline_rest else []
+            idx += 1
+            while idx < len(lines):
+                nxt = lines[idx].strip()
+                if not nxt or nxt.endswith(":"):
+                    break
+                sec_lines.append(nxt)
+                idx += 1
+            all_header_pkgs.extend(_split_package_tokens(sec_lines))
+            continue
+        idx += 1
+
+    if check_system and any(
+        _lookup_package_version(pkg, versions) == (None, None) for pkg in all_header_pkgs
+    ):
+        sys_versions = _read_system_dpkg_versions(dpkg_log_paths)
+        for k, v in sys_versions.items():
+            if k not in versions:
+                versions[k] = v
+
+    # Second pass: rewrite package sections in header as vertical lists with old -> new versions
+    formatted_lines: list[str] = []
+    has_package_section = False
+    i = 0
+    while i < len(lines):
+        stripped = lines[i].strip()
+        match = _PACKAGE_SECTION_RE.match(stripped)
+        if match:
+            has_package_section = True
+            section_title = match.group(1).strip()
+            inline_rest = match.group(2).strip()
+            pkg_lines: list[str] = [inline_rest] if inline_rest else []
+            i += 1
+            while i < len(lines):
+                next_stripped = lines[i].strip()
+                if not next_stripped or next_stripped.endswith(":"):
+                    break
+                pkg_lines.append(next_stripped)
+                i += 1
+
+            pkgs = _split_package_tokens(pkg_lines)
+            formatted_lines.append(f"{section_title}:")
+            for pkg in pkgs:
+                old_ver, new_ver = _lookup_package_version(pkg, versions)
+                formatted_lines.append(
+                    PackageUpgrade(name=pkg, old_version=old_ver, new_version=new_ver).format_line()
                 )
-            ]
-            if error_lines:
-                error_summary = "\nErrors encountered:\n" + "\n".join(error_lines[:5])
-                combined = f"{header}\n\n{error_summary}"
-                return truncate_text(combined, max_chars)
+            continue
 
-            log_excerpt = truncate_text(log_section, available_for_log)
-            return f"{header}\n\nPackage installation log:\n{log_excerpt}"
+        formatted_lines.append(lines[i])
+        i += 1
 
-        return truncate_text(header, max_chars)
+    # If header had no "Packages ...:" section at all, but dpkg unpacked upgrades in the log
+    if not has_package_section and versions:
+        unpacked = extract_upgraded_packages(
+            body, check_system=False, dpkg_log_paths=dpkg_log_paths
+        )
+        if unpacked:
+            if formatted_lines and formatted_lines[-1].strip():
+                formatted_lines.append("")
+            formatted_lines.append("Packages that were upgraded:")
+            for item in unpacked:
+                formatted_lines.append(item.format_line())
 
-    return truncate_text(body, max_chars)
+    formatted_header = "\n".join(formatted_lines).strip()
+
+    if log_section:
+        error_lines = _extract_error_lines(log_section)
+        if error_lines:
+            error_summary = "Errors encountered:\n" + "\n".join(error_lines[:5])
+            if formatted_header:
+                combined = f"{formatted_header}\n\n{error_summary}"
+            else:
+                combined = error_summary
+            return truncate_text(combined, max_chars)
+
+        if not formatted_header:
+            return truncate_text(f"Package installation log:\n{log_section}", max_chars)
+
+    return truncate_text(formatted_header, max_chars)
 
 
 _SUBJECT_FAILURE_RE = re.compile(
@@ -351,12 +748,26 @@ def check_reboot_required(
     return (email_indicates_reboot or system_indicates_reboot), system_pkgs
 
 
+def _is_upgrade_email(subject: str, body: str) -> bool:
+    """Return True if the email is an unattended-upgrades or package upgrade report."""
+    sub_lower = subject.lower()
+    body_lower = body.lower()
+    return (
+        "unattended-upgrade" in sub_lower
+        or "unattended upgrade" in sub_lower
+        or "unattended-upgrade" in body_lower
+        or "unattended upgrade" in body_lower
+        or "packages that were upgraded:" in body_lower
+    )
+
+
 def parse_email(
     raw_bytes: bytes,
     max_body_chars: int = 1500,
     *,
     fallback_sender: str | None = None,
     check_system_reboot: bool = True,
+    dpkg_log_paths: Sequence[Path] = DEFAULT_DPKG_LOG_PATHS,
 ) -> ParsedMessage:
     """Parse raw email bytes into a structured ParsedMessage."""
     if not raw_bytes or not raw_bytes.strip():
@@ -381,8 +792,19 @@ def parse_email(
     raw_body = extract_body(msg)
 
     # Format body: special handling for unattended-upgrades or standard truncation
-    if "unattended upgrade" in subject.lower() or "unattended upgrade" in raw_body.lower():
-        body = format_unattended_upgrades_body(raw_body, max_chars=max_body_chars)
+    upgraded_packages: list[PackageUpgrade] = []
+    if _is_upgrade_email(subject, raw_body):
+        upgraded_packages = extract_upgraded_packages(
+            raw_body,
+            check_system=check_system_reboot,
+            dpkg_log_paths=dpkg_log_paths,
+        )
+        body = format_unattended_upgrades_body(
+            raw_body,
+            max_chars=max_body_chars,
+            check_system=check_system_reboot,
+            dpkg_log_paths=dpkg_log_paths,
+        )
     else:
         body = truncate_text(raw_body, max_chars=max_body_chars)
 
@@ -401,4 +823,5 @@ def parse_email(
         hostname=hostname,
         reboot_required=reboot_required,
         reboot_packages=reboot_packages,
+        upgraded_packages=upgraded_packages,
     )
