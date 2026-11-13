@@ -24,7 +24,7 @@ Specifically designed for automated system notifications:
   - Webhook URL token is never logged or printed in clear text.
   - Mentions are neutralized with `"allowed_mentions": {"parse": []}` to prevent email content from triggering `@everyone`, `@here`, or role pings.
 - **Robust Charset & Multipart Handling**: Parses UTF-8, ISO-8859-1/Latin-1, Windows-1252, and multi-part messages; prefers `text/plain` and cleanly strips `text/html`.
-- **Specialized Summary Formatting**: Automatically extracts package lists and error logs from `unattended-upgrades` emails.
+- **Specialized Summary Formatting**: Automatically formats `unattended-upgrades` package lists vertically with `old → new` version transitions extracted from `dpkg` / `apt` logs and highlights genuine errors.
 - **Rate Limit & Transient Retry**: Automatically handles Discord HTTP `429` (honoring `Retry-After`) and transient `5xx` / network failures with exponential backoff.
 - **Optional Filtering**: Drop unrelated emails silently by matching sender addresses/domains or subject keywords.
 

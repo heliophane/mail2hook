@@ -15,6 +15,9 @@ Packages that failed to upgrade:
 
 Package installation log:
 Log started: 2026-11-11  06:30:10
+Preparing to unpack .../base-files_12.4+deb12u8_amd64.deb ...
+Unpacking base-files (12.4+deb12u8) over (12.4+deb12u7) ...
+Setting up base-files (12.4+deb12u8) ...
 dpkg: error processing package broken-pkg-example (--configure):
  subprocess installed post-installation script returned error exit status 1
 Errors were encountered while processing:
