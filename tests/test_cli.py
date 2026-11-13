@@ -164,14 +164,6 @@ def test_cli_permanent_failure(
     assert exit_code_404 == EXIT_CONFIG
 
 
-def test_cli_print_systemd_service(capsys: pytest.CaptureFixture[str]) -> None:
-    exit_code = run(["--print-systemd-service"])
-    assert exit_code == EXIT_OK
-    captured = capsys.readouterr()
-    assert "Description=mail2hook SMTP Daemon" in captured.out
-    assert "--smtp-listen" in captured.out
-
-
 def test_cli_mailq_mode(capsys: pytest.CaptureFixture[str]) -> None:
     exit_code = run(["-bp"])
     assert exit_code == EXIT_OK
@@ -219,6 +211,8 @@ def test_cli_sendmail_envelope_sender_and_dot_eof(monkeypatch: pytest.MonkeyPatc
     assert "Ignored after single dot" not in embed["description"]
     from_field = next(f for f in embed["fields"] if f["name"] == "From")
     assert "Cron Daemon (root@server01.example.com)" == from_field["value"]
+    to_field = next(f for f in embed["fields"] if f["name"] == "To")
+    assert to_field["value"] == "root"
 
 
 def test_cli_oversized_input(
@@ -234,27 +228,3 @@ def test_cli_oversized_input(
     assert exit_code == EXIT_DATAERR
     captured = capsys.readouterr()
     assert "exceeds maximum limit" in captured.err
-
-
-def test_cli_smtp_listen_invalid_port(
-    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
-) -> None:
-    monkeypatch.setenv("DISCORD_WEBHOOK_URL", VALID_WEBHOOK_URL)
-    exit_code = run(["--smtp-listen", "127.0.0.1:invalid"])
-    assert exit_code == EXIT_CONFIG
-    captured = capsys.readouterr()
-    assert "invalid port" in captured.err
-
-
-def test_cli_smtp_listen_runs_server(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv("DISCORD_WEBHOOK_URL", VALID_WEBHOOK_URL)
-
-    with patch("mail2hook.cli.run_smtp_server") as mock_server:
-        mock_server.return_value = None
-        exit_code = run(["--smtp-listen", "127.0.0.1:2525"])
-
-    assert exit_code == EXIT_OK
-    assert mock_server.call_count == 1
-    args, _kwargs = mock_server.call_args
-    assert args[0] == "127.0.0.1"
-    assert args[1] == 2525

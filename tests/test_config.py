@@ -123,3 +123,17 @@ def test_load_config_webhook_alias() -> None:
 
     cfg2 = load_config(environ={"DISCORD_WEBHOOK": VALID_WEBHOOK_URL})
     assert cfg2.discord_webhook_url == VALID_WEBHOOK_URL
+
+
+def test_load_config_quotes_comments_and_export(tmp_path: Path) -> None:
+    env_file = tmp_path / "quoted_env"
+    env_file.write_text(
+        "# Leading comment\n"
+        f'export DISCORD_WEBHOOK_URL="{VALID_WEBHOOK_URL}"\n'
+        "DISCORD_USERNAME='QuotedBot'\n"
+        "SERVER_NAME=web01 # inline comment\n"
+    )
+    cfg = load_config(env_file=env_file, environ={})
+    assert cfg.discord_webhook_url == VALID_WEBHOOK_URL
+    assert cfg.discord_username == "QuotedBot"
+    assert cfg.server_name == "web01"

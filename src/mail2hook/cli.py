@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import argparse
-import asyncio
 import json
 import logging
 import sys
@@ -19,7 +18,8 @@ from mail2hook.discord import (
 )
 from mail2hook.filters import should_process_message
 from mail2hook.parse import ParseError, parse_email
-from mail2hook.smtp import MAX_MESSAGE_BYTES, run_smtp_server
+
+MAX_MESSAGE_BYTES = 10 * 1024 * 1024  # 10 MiB
 
 # Postfix / sysexits.h standard exit codes
 EXIT_OK = 0  # EX_OK: Success or message filtered out
@@ -60,30 +60,9 @@ Unattended-Upgrade::Sender "unattended-upgrades";
 // Unattended-Upgrade::Automatic-Reboot-Time "03:00";
 """
 
-DEFAULT_SYSTEMD_SERVICE = """[Unit]
-Description=mail2hook SMTP Daemon
-Documentation=https://github.com/heliophane/mail2hook
-After=network.target
-
-[Service]
-Type=simple
-ExecStart=/opt/mail2hook/venv/bin/mail2hook --smtp-listen 127.0.0.1:25
-Restart=always
-RestartSec=5s
-EnvironmentFile=-/etc/mail2hook/env
-# If running as a dedicated non-root user, uncomment the following:
-# User=mail2hook
-# Group=mail2hook
-# AmbientCapabilities=CAP_NET_BIND_SERVICE
-# CapabilityBoundingSet=CAP_NET_BIND_SERVICE
-
-[Install]
-WantedBy=multi-user.target
-"""
-
 
 def build_parser() -> argparse.ArgumentParser:
-    """Create command-line argument parser with full sendmail CLI compatibility."""
+    """Create command-line argument parser with sendmail CLI compatibility."""
     parser = argparse.ArgumentParser(
         prog="mail2hook",
         description=(
@@ -112,18 +91,6 @@ def build_parser() -> argparse.ArgumentParser:
         "--print-apt-config",
         action="store_true",
         help="Print recommended /etc/apt/apt.conf.d/52mail2hook configuration and exit.",
-    )
-    parser.add_argument(
-        "--print-systemd-service",
-        action="store_true",
-        help="Print systemd service unit template for running SMTP daemon and exit.",
-    )
-    parser.add_argument(
-        "--smtp-listen",
-        metavar="[HOST:]PORT",
-        nargs="?",
-        const="127.0.0.1:25",
-        help="Run built-in SMTP daemon listening on [HOST:]PORT (default: 127.0.0.1:25).",
     )
     parser.add_argument(
         "--version",
@@ -264,10 +231,6 @@ def run(argv: list[str] | None = None) -> int:
         sys.stdout.write(DEFAULT_APT_CONFIG)
         return EXIT_OK
 
-    if args.print_systemd_service:
-        sys.stdout.write(DEFAULT_SYSTEMD_SERVICE)
-        return EXIT_OK
-
     if getattr(args, "verbose", False):
         logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
 
@@ -280,35 +243,6 @@ def run(argv: list[str] | None = None) -> int:
     except Exception as err:
         sys.stderr.write(f"mail2hook: unexpected error loading config: {err}\n")
         return EXIT_CONFIG
-
-    # Check for SMTP daemon mode
-    if args.smtp_listen:
-        listen_str = args.smtp_listen
-        if ":" in listen_str:
-            host, port_str = listen_str.rsplit(":", 1)
-            host = host or "127.0.0.1"
-            try:
-                port = int(port_str)
-            except ValueError:
-                sys.stderr.write(f"mail2hook: invalid port in --smtp-listen: {port_str}\n")
-                return EXIT_CONFIG
-        else:
-            host = "127.0.0.1"
-            try:
-                port = int(listen_str)
-            except ValueError:
-                sys.stderr.write(f"mail2hook: invalid port in --smtp-listen: {listen_str}\n")
-                return EXIT_CONFIG
-
-        logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
-        try:
-            asyncio.run(run_smtp_server(host, port, config))
-        except KeyboardInterrupt:
-            pass
-        except Exception as err:
-            sys.stderr.write(f"mail2hook: SMTP server error: {err}\n")
-            return EXIT_CONFIG
-        return EXIT_OK
 
     # 2. Read raw email bytes (bounded to MAX_MESSAGE_BYTES)
     try:
@@ -335,11 +269,15 @@ def run(argv: list[str] | None = None) -> int:
 
     # 3. Parse email
     fallback_sender = _build_fallback_sender(args)
+    fallback_to = (
+        ", ".join(r.strip() for r in args.recipients if r.strip()) if args.recipients else None
+    )
     try:
         msg = parse_email(
             raw_bytes,
             max_body_chars=config.max_body_chars,
             fallback_sender=fallback_sender,
+            fallback_to=fallback_to,
         )
     except ParseError as err:
         sys.stderr.write(f"mail2hook: unparseable email data: {err}\n")
