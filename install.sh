@@ -6,24 +6,24 @@
 #   - Debian 13 (trixie)
 #   - Ubuntu 24.04 LTS (noble)
 #   - Ubuntu 26.04 LTS (resolute)
-#
-# Note on security upgrades:
-#   Security upgrades to mail2hook's runtime dependencies (such as system python3
-#   or OpenSSL libraries) take effect for the mail2hook.service SMTP daemon on the
-#   next service restart (`sudo systemctl restart mail2hook.service`). Direct
-#   invocations via `/usr/sbin/sendmail` spawn a fresh process on each run.
 
 set -euo pipefail
 
-readonly REPO_URL="https://github.com/heliophane/mail2hook.git"
+readonly REPO_URL="https://github.com/heliophane/mail2hook"
 readonly API_RELEASES_URL="https://api.github.com/repos/heliophane/mail2hook/releases/latest"
-readonly INSTALL_DIR="/opt/mail2hook"
-readonly VENV_DIR="/opt/mail2hook/venv"
+readonly BIN_PATH="/usr/local/bin/mail2hook"
+readonly SENDMAIL_PATH="/usr/sbin/sendmail"
+readonly MAILQ_PATH="/usr/bin/mailq"
 readonly CONFIG_DIR="/etc/mail2hook"
 readonly ENV_FILE="/etc/mail2hook/env"
-readonly SERVICE_USER="mail2hook"
-readonly SERVICE_GROUP="mail2hook"
-readonly SERVICE_FILE="/etc/systemd/system/mail2hook.service"
+
+# Legacy layout paths from earlier service-based versions (used for clean migration)
+readonly LEGACY_INSTALL_DIR="/opt/mail2hook"
+readonly LEGACY_VENV_DIR="/opt/mail2hook/venv"
+readonly LEGACY_SERVICE_USER="mail2hook"
+readonly LEGACY_SERVICE_GROUP="mail2hook"
+readonly LEGACY_SERVICE_FILE="/etc/systemd/system/mail2hook.service"
+readonly LEGACY_SERVICE_WANT="/etc/systemd/system/multi-user.target.wants/mail2hook.service"
 
 readonly APT_AUTO_UPGRADES="/etc/apt/apt.conf.d/20auto-upgrades"
 readonly APT_LOCAL_UPGRADES="/etc/apt/apt.conf.d/52-unattended-upgrades-local"
@@ -43,11 +43,15 @@ FLAG_UNINSTALL=0
 FLAG_PURGE_UPGRADES=0
 FLAG_YES=0
 
-# Detected OS variables
+# Runtime state
 OS_ID=""
 OS_VERSION_ID=""
 OS_CODENAME=""
 OS_PRETTY=""
+ENV_GROUP="mail"
+RESOLVED_WEBHOOK_URL=""
+SENDMAIL_LINKED=0
+E2E_STATUS="not run"
 
 log_info() {
     printf '[INFO] %s\n' "$*"
@@ -65,13 +69,13 @@ usage() {
     cat <<'EOF'
 Usage: install.sh [OPTIONS]
 
-Install and configure mail2hook along with conservative, security-only
-unattended-upgrades on Debian 12/13 and Ubuntu 24.04/26.04.
+Install mail2hook as a lightweight sendmail shim and configure conservative,
+security-only unattended-upgrades on Debian 12/13 and Ubuntu 24.04/26.04.
 
 Options:
   --webhook-url <url>   Set Discord webhook URL (or pass DISCORD_WEBHOOK_URL env var)
   --skip-upgrades       Skip installing and configuring unattended-upgrades
-  --uninstall           Remove mail2hook service, user, symlinks, and install directory
+  --uninstall           Remove mail2hook executable and sendmail link/alternative
   --purge-upgrades      With --uninstall, also remove unattended-upgrades drop-ins and timer overrides
   --yes, -y             Non-interactive mode; accept defaults and do not prompt
   --help, -h            Show this help message and exit
@@ -152,7 +156,6 @@ detect_os() {
         exit 1
     fi
 
-    # Read ID, VERSION_ID, VERSION_CODENAME, PRETTY_NAME safely
     # shellcheck disable=SC1090
     . "$os_release_file"
 
@@ -181,6 +184,10 @@ detect_os() {
             ;;
     esac
 
+    if ! getent group "$ENV_GROUP" >/dev/null 2>&1; then
+        ENV_GROUP="root"
+    fi
+
     log_info "Detected supported OS: ${OS_PRETTY} (${OS_ID} ${OS_VERSION_ID}, codename: ${OS_CODENAME})"
 }
 
@@ -188,7 +195,7 @@ is_systemd_running() {
     [[ -d /run/systemd/system ]] && command -v systemctl >/dev/null 2>&1
 }
 
-backup_if_Modified_or_existing() {
+backup_if_unmanaged() {
     local target="$1"
     local marker="${2:-Managed by mail2hook install.sh}"
 
@@ -204,7 +211,6 @@ backup_if_Modified_or_existing() {
 
 validate_webhook() {
     local url="${1:-}"
-    # Trim leading and trailing whitespace
     url="${url#"${url%%[![:space:]]*}"}"
     url="${url%"${url##*[![:space:]]}"}"
     [[ -n "$url" && "$url" =~ $WEBHOOK_REGEX ]]
@@ -217,13 +223,11 @@ read_existing_webhook() {
 
     local line key val
     while IFS= read -r line || [[ -n "$line" ]]; do
-        # Skip comments and empty lines
         [[ "$line" =~ ^[[:space:]]*# ]] && continue
         [[ "$line" =~ ^[[:space:]]*$ ]] && continue
-        if [[ "$line" =~ ^[[:space:]]*(DISCORD_WEBHOOK_URL|DISCORD_WEBHOOK|WEBHOOK_URL)[[:space:]]*=(.*)$ ]]; then
-            key="${BASH_REMATCH[1]}"
-            val="${BASH_REMATCH[2]}"
-            # Strip surrounding quotes and whitespace
+        if [[ "$line" =~ ^[[:space:]]*(export[[:space:]]+)?(DISCORD_WEBHOOK_URL|DISCORD_WEBHOOK|WEBHOOK_URL)[[:space:]]*=(.*)$ ]]; then
+            key="${BASH_REMATCH[2]}"
+            val="${BASH_REMATCH[3]}"
             val="${val#"${val%%[![:space:]]*}"}"
             val="${val%"${val##*[![:space:]]}"}"
             val="${val#\"}"
@@ -231,6 +235,12 @@ read_existing_webhook() {
             val="${val#\'}"
             val="${val%\'}"
             if [[ -n "$key" ]] && validate_webhook "$val"; then
+                printf '%s' "$val"
+                return 0
+            fi
+        elif [[ "$line" =~ ^[[:space:]]*(https://[^[:space:]]+)$ ]]; then
+            val="${BASH_REMATCH[1]}"
+            if validate_webhook "$val"; then
                 printf '%s' "$val"
                 return 0
             fi
@@ -304,7 +314,7 @@ resolve_webhook_url() {
         return 0
     fi
 
-    # 2. Check if a valid webhook already exists in /etc/mail2hook/env
+    # 2. Keep an existing valid webhook in /etc/mail2hook/env unless told to replace it
     local existing_url=""
     if existing_url="$(read_existing_webhook)"; then
         if [[ "$FLAG_YES" -eq 1 ]]; then
@@ -320,7 +330,7 @@ resolve_webhook_url() {
         fi
     fi
 
-    # 3. Interactive prompt via /dev/tty
+    # 3. Interactive prompt via /dev/tty with hidden input
     if [[ "$FLAG_YES" -eq 1 ]]; then
         log_error "Non-interactive mode (--yes) set, but no Discord webhook URL was provided via --webhook-url, DISCORD_WEBHOOK_URL, or $ENV_FILE."
         exit 1
@@ -363,8 +373,6 @@ install_system_packages() {
 
     local -a pkgs=(
         python3
-        python3-venv
-        git
         ca-certificates
         curl
     )
@@ -376,57 +384,115 @@ install_system_packages() {
         fi
     fi
 
-    log_info "Installing required packages: ${pkgs[*]}"
+    log_info "Installing minimal required packages: ${pkgs[*]}"
     apt-get install -y -qq --no-install-recommends "${pkgs[@]}"
 
-    # Verify Python >= 3.11 (required by pyproject.toml requires-python = ">=3.11")
     if ! python3 -c 'import sys; sys.exit(0 if sys.version_info >= (3, 11) else 1)'; then
         local py_ver
         py_ver="$(python3 -c 'import platform; print(platform.python_version())' 2>/dev/null || echo 'unknown')"
         log_error "Python >= 3.11 is required by mail2hook, but found Python ${py_ver}."
         exit 1
     fi
+}
 
-    # Remove conflicting MTAs so /usr/sbin/sendmail and port 25 are free
-    local -a purge_pkgs=()
-    local -a candidate_mtas=(postfix bsd-mailx)
-    if [[ "$OS_ID" == "debian" ]]; then
-        candidate_mtas+=(exim4 exim4-base exim4-config exim4-daemon-light exim4-daemon-heavy)
+migrate_legacy_service() {
+    local found_legacy=0
+
+    # 1. Stop, disable, and delete legacy systemd service unit if present
+    if is_systemd_running; then
+        if systemctl list-unit-files --no-legend mail2hook.service 2>/dev/null | grep -q 'mail2hook\.service' \
+            || systemctl is-active --quiet mail2hook.service 2>/dev/null \
+            || systemctl is-enabled --quiet mail2hook.service 2>/dev/null; then
+            found_legacy=1
+            systemctl stop mail2hook.service 2>/dev/null || true
+            systemctl disable mail2hook.service 2>/dev/null || true
+            log_info "Stopped and disabled legacy mail2hook.service."
+        fi
     fi
 
-    local pkg
-    for pkg in "${candidate_mtas[@]}"; do
-        if dpkg-query -W -f='${Status}' "$pkg" 2>/dev/null | grep -q "install ok installed"; then
-            purge_pkgs+=("$pkg")
+    local unit_path
+    for unit_path in "$LEGACY_SERVICE_FILE" "$LEGACY_SERVICE_WANT" "/lib/systemd/system/mail2hook.service"; do
+        if [[ -e "$unit_path" || -L "$unit_path" ]]; then
+            found_legacy=1
+            rm -f "$unit_path"
+            log_info "Removed legacy systemd unit file/symlink: $unit_path"
         fi
     done
 
-    if [[ "${#purge_pkgs[@]}" -gt 0 ]]; then
-        log_info "Stopping and purging conflicting MTA packages: ${purge_pkgs[*]}"
-        if is_systemd_running; then
-            systemctl stop exim4 postfix 2>/dev/null || true
+    if [[ "$found_legacy" -eq 1 ]] && is_systemd_running; then
+        systemctl daemon-reload
+        log_info "Reloaded systemd daemon."
+    fi
+
+    # 2. Remove legacy mta alternative or symlinks pointing into /opt/mail2hook
+    if command -v update-alternatives >/dev/null 2>&1; then
+        if update-alternatives --query mta 2>/dev/null | grep -Fq "${LEGACY_VENV_DIR}/bin/mail2hook"; then
+            update-alternatives --remove mta "${LEGACY_VENV_DIR}/bin/mail2hook" 2>/dev/null || true
+            log_info "Removed legacy mta alternative for ${LEGACY_VENV_DIR}/bin/mail2hook"
         fi
-        apt-get purge -y -qq "${purge_pkgs[@]}" || true
-    fi
-}
-
-ensure_service_user() {
-    if ! getent group "$SERVICE_GROUP" >/dev/null 2>&1; then
-        log_info "Creating system group '$SERVICE_GROUP'..."
-        groupadd --system "$SERVICE_GROUP"
     fi
 
-    if ! id -u "$SERVICE_USER" >/dev/null 2>&1; then
-        local nologin_shell="/usr/sbin/nologin"
-        [[ ! -x "$nologin_shell" && -x "/sbin/nologin" ]] && nologin_shell="/sbin/nologin"
-        log_info "Creating unprivileged system user '$SERVICE_USER'..."
-        useradd --system \
-            --gid "$SERVICE_GROUP" \
-            --home-dir "$INSTALL_DIR" \
-            --no-create-home \
-            --shell "$nologin_shell" \
-            --comment "mail2hook service user" \
-            "$SERVICE_USER"
+    local link target
+    for link in "$BIN_PATH" "$SENDMAIL_PATH" "$MAILQ_PATH"; do
+        if [[ -L "$link" ]]; then
+            target="$(readlink "$link" || true)"
+            if [[ "$target" == "${LEGACY_INSTALL_DIR}"* ]]; then
+                rm -f "$link"
+                log_info "Removed legacy symlink $link -> $target"
+            fi
+        fi
+    done
+
+    # 3. Remove legacy /opt/mail2hook venv and directory only if nothing else uses it
+    if [[ -d "$LEGACY_VENV_DIR" ]]; then
+        rm -rf "$LEGACY_VENV_DIR"
+        log_info "Removed legacy virtualenv directory $LEGACY_VENV_DIR"
+    fi
+
+    if [[ -d "$LEGACY_INSTALL_DIR" ]]; then
+        if [[ -z "$(ls -A "$LEGACY_INSTALL_DIR" 2>/dev/null)" ]]; then
+            rmdir "$LEGACY_INSTALL_DIR"
+            log_info "Removed legacy install directory $LEGACY_INSTALL_DIR"
+        else
+            log_warn "Skipped removing $LEGACY_INSTALL_DIR because unexpected files remain inside."
+        fi
+    fi
+
+    # 4. Reassign /etc/mail2hook ownership before removing the old service user/group
+    if [[ -d "$CONFIG_DIR" ]]; then
+        chown -R "root:${ENV_GROUP}" "$CONFIG_DIR"
+    fi
+
+    # 5. Remove legacy mail2hook service user/group only if created by mail2hook and unused
+    if id -u "$LEGACY_SERVICE_USER" >/dev/null 2>&1; then
+        local passwd_entry user_home user_shell user_gecos
+        passwd_entry="$(getent passwd "$LEGACY_SERVICE_USER" || true)"
+        user_gecos="$(printf '%s' "$passwd_entry" | cut -d: -f5)"
+        user_home="$(printf '%s' "$passwd_entry" | cut -d: -f6)"
+        user_shell="$(printf '%s' "$passwd_entry" | cut -d: -f7)"
+
+        if [[ "$user_home" == "$LEGACY_INSTALL_DIR" || "$user_gecos" == *"mail2hook"* ]] \
+            && [[ "$user_shell" == *"nologin"* || "$user_shell" == *"false"* ]]; then
+            if command -v pgrep >/dev/null 2>&1 && pgrep -u "$LEGACY_SERVICE_USER" >/dev/null 2>&1; then
+                log_warn "Skipped removing user '$LEGACY_SERVICE_USER' because processes are still running as that user."
+            else
+                userdel "$LEGACY_SERVICE_USER" 2>/dev/null || true
+                log_info "Removed legacy system user '$LEGACY_SERVICE_USER'"
+            fi
+        else
+            log_warn "Skipped removing user '$LEGACY_SERVICE_USER' (does not match mail2hook service user signature)."
+        fi
+    fi
+
+    if getent group "$LEGACY_SERVICE_GROUP" >/dev/null 2>&1; then
+        local group_members
+        group_members="$(getent group "$LEGACY_SERVICE_GROUP" | cut -d: -f4)"
+        if [[ -z "$group_members" ]] && ! id -u "$LEGACY_SERVICE_USER" >/dev/null 2>&1; then
+            groupdel "$LEGACY_SERVICE_GROUP" 2>/dev/null || true
+            log_info "Removed legacy system group '$LEGACY_SERVICE_GROUP'"
+        elif [[ -n "$group_members" ]]; then
+            log_warn "Skipped removing group '$LEGACY_SERVICE_GROUP' (still has members: $group_members)."
+        fi
     fi
 }
 
@@ -453,8 +519,7 @@ detect_local_checkout() {
     return 1
 }
 
-resolve_github_source() {
-    # Prefer a tagged release if the project has releases on GitHub; otherwise use default branch
+resolve_github_tarball_url() {
     local tag=""
     if command -v curl >/dev/null 2>&1; then
         tag="$(curl -fsSL --connect-timeout 5 --max-time 10 "$API_RELEASES_URL" 2>/dev/null \
@@ -463,63 +528,173 @@ resolve_github_source() {
     fi
 
     if [[ -n "$tag" ]]; then
-        printf 'git+%s@%s' "$REPO_URL" "$tag"
+        printf '%s/archive/refs/tags/%s.tar.gz' "$REPO_URL" "$tag"
     else
-        printf 'git+%s' "$REPO_URL"
+        printf '%s/archive/refs/heads/main.tar.gz' "$REPO_URL"
     fi
 }
 
-install_mail2hook_venv() {
-    install -d -m 0755 -o root -g root "$INSTALL_DIR"
+install_mail2hook_binary() {
+    local work_dir
+    work_dir="$(mktemp -d)"
 
-    if [[ ! -x "$VENV_DIR/bin/python" ]]; then
-        log_info "Creating Python virtual environment at $VENV_DIR..."
-        python3 -m venv "$VENV_DIR"
-    fi
-
-    log_info "Upgrading pip in virtual environment..."
-    "$VENV_DIR/bin/pip" install --quiet --upgrade pip
-
+    local src_root=""
     local local_checkout=""
     if local_checkout="$(detect_local_checkout)"; then
-        log_info "Installing mail2hook from local checkout ($local_checkout)..."
-        local build_tmp
-        build_tmp="$(mktemp -d)"
-        cp -a "$local_checkout/pyproject.toml" "$local_checkout/README.md" "$local_checkout/src" "$build_tmp/"
-        rm -rf "$build_tmp/src/mail2hook.egg-info"
-        "$VENV_DIR/bin/pip" install --quiet --upgrade "$build_tmp"
-        rm -rf "$build_tmp"
+        log_info "Packaging mail2hook from local checkout ($local_checkout)..."
+        src_root="$local_checkout/src"
     else
-        local remote_spec
-        remote_spec="$(resolve_github_source)"
-        log_info "Installing mail2hook from $remote_spec..."
-        "$VENV_DIR/bin/pip" install --quiet --upgrade "$remote_spec"
+        local tarball_url
+        tarball_url="$(resolve_github_tarball_url)"
+        log_info "Downloading mail2hook source from $tarball_url..."
+        local tarball_path="$work_dir/mail2hook.tar.gz"
+        if ! curl -fsSL --connect-timeout 10 --max-time 60 "$tarball_url" -o "$tarball_path"; then
+            rm -rf "$work_dir"
+            log_error "Failed to download mail2hook source archive."
+            exit 1
+        fi
+        tar -xzf "$tarball_path" -C "$work_dir"
+        src_root="$(find "$work_dir" -maxdepth 2 -type d -name src | head -n 1 || true)"
+        if [[ -z "$src_root" || ! -d "$src_root/mail2hook" ]]; then
+            rm -rf "$work_dir"
+            log_error "Downloaded archive did not contain src/mail2hook."
+            exit 1
+        fi
     fi
 
-    chown -R root:root "$INSTALL_DIR"
+    local stage_dir="$work_dir/stage"
+    mkdir -p "$stage_dir"
+    cp -a "$src_root/mail2hook" "$stage_dir/"
+    find "$stage_dir" -type d -name "__pycache__" -exec rm -rf {} + 2>/dev/null || true
 
-    # Create standard CLI and sendmail/mailq drop-in symlinks
-    install -d -m 0755 /usr/local/bin /usr/sbin /usr/bin
-    ln -sf "$VENV_DIR/bin/mail2hook" /usr/local/bin/mail2hook
-    ln -sf "$VENV_DIR/bin/mail2hook" /usr/sbin/sendmail
-    ln -sf "$VENV_DIR/bin/mail2hook" /usr/bin/mailq
-    log_info "Linked mail2hook to /usr/local/bin/mail2hook, /usr/sbin/sendmail, and /usr/bin/mailq"
+    local tmp_bin="$work_dir/mail2hook"
+    python3 -m zipapp "$stage_dir" \
+        -p "/usr/bin/env python3" \
+        -m "mail2hook.cli:main" \
+        -o "$tmp_bin"
+
+    install -d -m 0755 /usr/local/bin
+    install -m 0755 -o root -g root "$tmp_bin" "$BIN_PATH"
+    rm -rf "$work_dir"
+
+    log_info "Installed executable at $BIN_PATH"
+}
+
+detect_conflicting_mta() {
+    local -a mta_pkgs=(
+        postfix
+        exim4
+        exim4-base
+        exim4-daemon-light
+        exim4-daemon-heavy
+        msmtp-mta
+        nullmailer
+        sendmail-bin
+        dma
+        opensmtpd
+        ssmtp
+    )
+    local -a installed=()
+    local pkg
+    for pkg in "${mta_pkgs[@]}"; do
+        if dpkg-query -W -f='${Status}' "$pkg" 2>/dev/null | grep -q "install ok installed"; then
+            installed+=("$pkg")
+        fi
+    done
+
+    if [[ "${#installed[@]}" -gt 0 ]]; then
+        printf '%s' "${installed[*]}"
+        return 0
+    fi
+    return 1
+}
+
+configure_sendmail_link() {
+    SENDMAIL_LINKED=0
+    install -d -m 0755 /usr/sbin /usr/bin
+
+    local existing_mtas=""
+    if existing_mtas="$(detect_conflicting_mta)"; then
+        log_warn "Detected existing MTA package(s): ${existing_mtas}."
+        log_warn "Will NOT overwrite $SENDMAIL_PATH or purge your existing MTA."
+        log_warn "Either remove the existing MTA and re-run this installer, or configure it to pipe mail to $BIN_PATH."
+        return 0
+    fi
+
+    # Check if /usr/sbin/sendmail is already occupied by something other than mail2hook
+    if [[ -e "$SENDMAIL_PATH" || -L "$SENDMAIL_PATH" ]]; then
+        local resolved_sendmail=""
+        resolved_sendmail="$(readlink -f "$SENDMAIL_PATH" 2>/dev/null || true)"
+
+        if [[ "$resolved_sendmail" == "$BIN_PATH" ]]; then
+            log_info "$SENDMAIL_PATH already points to $BIN_PATH."
+        elif command -v update-alternatives >/dev/null 2>&1 \
+            && [[ -L "$SENDMAIL_PATH" ]] \
+            && [[ "$(readlink "$SENDMAIL_PATH" 2>/dev/null || true)" == "/etc/alternatives/mta" ]]; then
+            local current_mta=""
+            current_mta="$(update-alternatives --query mta 2>/dev/null | sed -n 's/^Value: //p' | head -n 1 || true)"
+            if [[ -n "$current_mta" && "$current_mta" != "$BIN_PATH" ]]; then
+                log_warn "System 'mta' alternative currently points to $current_mta."
+                log_warn "Will NOT overwrite $SENDMAIL_PATH automatically."
+                log_warn "To switch to mail2hook manually, register $BIN_PATH with update-alternatives or remove the other MTA."
+                return 0
+            fi
+        else
+            local owner_pkg=""
+            owner_pkg="$(dpkg-query -S "$SENDMAIL_PATH" 2>/dev/null | head -n 1 || true)"
+            log_warn "Existing $SENDMAIL_PATH found (${owner_pkg:-unmanaged file/symlink -> ${resolved_sendmail:-unknown}})."
+            log_warn "Will NOT overwrite $SENDMAIL_PATH so your existing mail setup is not clobbered."
+            return 0
+        fi
+    fi
+
+    if command -v update-alternatives >/dev/null 2>&1; then
+        local can_slave_mailq=0
+        if [[ ! -e "$MAILQ_PATH" && ! -L "$MAILQ_PATH" ]]; then
+            can_slave_mailq=1
+        elif [[ "$(readlink -f "$MAILQ_PATH" 2>/dev/null || true)" == "$BIN_PATH" ]]; then
+            can_slave_mailq=1
+        elif [[ -L "$MAILQ_PATH" && "$(readlink "$MAILQ_PATH" 2>/dev/null || true)" == "/etc/alternatives/mta-mailq" ]]; then
+            can_slave_mailq=1
+        fi
+
+        if [[ "$can_slave_mailq" -eq 1 ]]; then
+            update-alternatives --install "$SENDMAIL_PATH" mta "$BIN_PATH" 10 \
+                --slave "$MAILQ_PATH" mta-mailq "$BIN_PATH"
+            log_info "Configured sendmail and mailq via update-alternatives (mta -> $BIN_PATH)"
+        else
+            update-alternatives --install "$SENDMAIL_PATH" mta "$BIN_PATH" 10
+            log_info "Configured sendmail via update-alternatives (mta -> $BIN_PATH)"
+        fi
+    else
+        ln -sf "$BIN_PATH" "$SENDMAIL_PATH"
+        if [[ ! -e "$MAILQ_PATH" || "$(readlink -f "$MAILQ_PATH" 2>/dev/null || true)" == "$BIN_PATH" ]]; then
+            ln -sf "$BIN_PATH" "$MAILQ_PATH"
+        fi
+        log_info "Linked $SENDMAIL_PATH -> $BIN_PATH"
+    fi
+
+    SENDMAIL_LINKED=1
 }
 
 write_env_file() {
-    install -d -m 0750 -o root -g "$SERVICE_GROUP" "$CONFIG_DIR"
+    install -d -m 0750 -o root -g "$ENV_GROUP" "$CONFIG_DIR"
 
     local tmp_env
     tmp_env="$(mktemp "${CONFIG_DIR}/.env.tmp.XXXXXX")"
-    chown root:"$SERVICE_GROUP" "$tmp_env"
+    chown "root:${ENV_GROUP}" "$tmp_env"
     chmod 0640 "$tmp_env"
 
     if [[ -f "$ENV_FILE" ]]; then
-        # Preserve existing non-webhook settings and comments, updating DISCORD_WEBHOOK_URL in place
         local updated=0
         local line
         while IFS= read -r line || [[ -n "$line" ]]; do
-            if [[ "$line" =~ ^[[:space:]]*(DISCORD_WEBHOOK_URL|DISCORD_WEBHOOK|WEBHOOK_URL)[[:space:]]*= ]]; then
+            if [[ "$line" =~ ^[[:space:]]*(export[[:space:]]+)?(DISCORD_WEBHOOK_URL|DISCORD_WEBHOOK|WEBHOOK_URL)[[:space:]]*= ]]; then
+                if [[ "$updated" -eq 0 ]]; then
+                    printf 'DISCORD_WEBHOOK_URL=%s\n' "$RESOLVED_WEBHOOK_URL" >> "$tmp_env"
+                    updated=1
+                fi
+            elif [[ "$line" =~ ^[[:space:]]*https://((ptb|canary)\.)?discord(app)?\.com/api/webhooks/ ]]; then
                 if [[ "$updated" -eq 0 ]]; then
                     printf 'DISCORD_WEBHOOK_URL=%s\n' "$RESOLVED_WEBHOOK_URL" >> "$tmp_env"
                     updated=1
@@ -535,8 +710,9 @@ write_env_file() {
     else
         cat > "$tmp_env" <<EOF
 # /etc/mail2hook/env - Configuration for mail2hook
-# Owned by root:${SERVICE_GROUP} (mode 0640) so both root sendmail invocations
-# and the unprivileged ${SERVICE_USER} systemd service can read it.
+# Owned by root:${ENV_GROUP} (mode 0640): readable by root callers (cron,
+# unattended-upgrades) and users in the '${ENV_GROUP}' group, while keeping the
+# Discord webhook secret hidden from unprivileged users.
 
 # Required: Discord webhook URL
 DISCORD_WEBHOOK_URL=${RESOLVED_WEBHOOK_URL}
@@ -558,71 +734,13 @@ DISCORD_WEBHOOK_URL=${RESOLVED_WEBHOOK_URL}
 EOF
     fi
 
-    chown root:"$SERVICE_GROUP" "$tmp_env"
+    chown "root:${ENV_GROUP}" "$tmp_env"
     chmod 0640 "$tmp_env"
     mv -f "$tmp_env" "$ENV_FILE"
-    log_info "Secured configuration file at $ENV_FILE (root:${SERVICE_GROUP}, mode 0640)"
-}
-
-install_systemd_service() {
-    backup_if_Modified_or_existing "$SERVICE_FILE" "Managed by mail2hook install.sh"
-
-    cat > "$SERVICE_FILE" <<EOF
-# Managed by mail2hook install.sh
-# Note: Security upgrades to mail2hook's runtime dependencies (such as python3 or libssl)
-# take effect for this daemon on the next service restart:
-#   sudo systemctl restart mail2hook.service
-[Unit]
-Description=mail2hook Lightweight SMTP Daemon
-Documentation=https://github.com/heliophane/mail2hook
-After=network-online.target
-Wants=network-online.target
-
-[Service]
-Type=simple
-User=${SERVICE_USER}
-Group=${SERVICE_GROUP}
-ExecStart=${VENV_DIR}/bin/mail2hook --smtp-listen 127.0.0.1:25
-EnvironmentFile=${ENV_FILE}
-Restart=on-failure
-RestartSec=5s
-
-# Bind privileged port 25 without running as root
-AmbientCapabilities=CAP_NET_BIND_SERVICE
-CapabilityBoundingSet=CAP_NET_BIND_SERVICE
-
-# Hardening options
-NoNewPrivileges=true
-ProtectSystem=strict
-ProtectHome=true
-PrivateTmp=true
-PrivateDevices=true
-ProtectKernelTunables=true
-ProtectKernelModules=true
-ProtectControlGroups=true
-RestrictSUIDSGID=true
-LockPersonality=true
-UMask=0077
-
-[Install]
-WantedBy=multi-user.target
-EOF
-
-    chmod 0644 "$SERVICE_FILE"
-    log_info "Wrote systemd unit file to $SERVICE_FILE"
-
-    if is_systemd_running; then
-        systemctl daemon-reload
-        systemctl enable mail2hook.service
-        systemctl restart mail2hook.service
-        log_info "Enabled and started mail2hook.service"
-    else
-        log_warn "systemd is not running as PID 1 (container environment); skipped starting mail2hook.service."
-    fi
+    log_info "Secured configuration file at $ENV_FILE (root:${ENV_GROUP}, mode 0640)"
 }
 
 ubuntu_esm_security_present() {
-    # Include Ubuntu ESM security origins only if Ubuntu Pro / ESM sources are present on this machine
     local f
     for f in /etc/apt/sources.list /etc/apt/sources.list.d/*.list /etc/apt/sources.list.d/*.sources; do
         [[ -f "$f" ]] || continue
@@ -641,13 +759,12 @@ configure_unattended_upgrades() {
 
     log_info "Configuring conservative security-only unattended-upgrades..."
 
-    # Remove legacy 52mail2hook if present so settings are consolidated cleanly
     if [[ -f "$APT_LEGACY_MAIL2HOOK" ]]; then
-        backup_if_Modified_or_existing "$APT_LEGACY_MAIL2HOOK" "Default unattended-upgrades configuration for mail2hook"
+        backup_if_unmanaged "$APT_LEGACY_MAIL2HOOK" "Default unattended-upgrades configuration for mail2hook"
         rm -f "$APT_LEGACY_MAIL2HOOK"
     fi
 
-    backup_if_Modified_or_existing "$APT_AUTO_UPGRADES" "Managed by mail2hook install.sh"
+    backup_if_unmanaged "$APT_AUTO_UPGRADES" "Managed by mail2hook install.sh"
     cat > "$APT_AUTO_UPGRADES" <<'EOF'
 // Managed by mail2hook install.sh
 APT::Periodic::Update-Package-Lists "1";
@@ -656,12 +773,8 @@ APT::Periodic::AutocleanInterval "7";
 EOF
     chmod 0644 "$APT_AUTO_UPGRADES"
 
-    backup_if_Modified_or_existing "$APT_LOCAL_UPGRADES" "Managed by mail2hook install.sh"
+    backup_if_unmanaged "$APT_LOCAL_UPGRADES" "Managed by mail2hook install.sh"
 
-    # Build distro-specific security-only origin blocks.
-    # Both Origins-Pattern and Allowed-Origins are cleared first with #clear so
-    # non-security origins from 50unattended-upgrades (e.g. o=Debian,n=<codename>,l=Debian
-    # or Ubuntu:<codename>) are replaced rather than appended to.
     local origins_block=""
     if [[ "$OS_ID" == "debian" ]]; then
         origins_block=$(cat <<'EOF'
@@ -697,8 +810,6 @@ EOF
     cat > "$APT_LOCAL_UPGRADES" <<EOF
 // Managed by mail2hook install.sh
 // Security-only unattended-upgrades drop-in configuration.
-// Note: Security upgrades to mail2hook's dependencies take effect for the
-// mail2hook.service daemon on the next service restart.
 
 ${origins_block}
 
@@ -707,23 +818,20 @@ Unattended-Upgrade::Mail "root";
 Unattended-Upgrade::MailReport "always";
 Unattended-Upgrade::Sender "unattended-upgrades";
 
-// Never reboot automatically under any circumstance; mail2hook reports pending reboots in Discord
+// Never reboot automatically; mail2hook reports pending reboots in Discord
 Unattended-Upgrade::Automatic-Reboot "false";
 Unattended-Upgrade::Automatic-Reboot-WithUsers "false";
 
-// Conservative "no surprises" removal policy:
-// Left set to "false" so an unattended security run never auto-removes packages
-// or running/fallback kernels that local scripts or administrators might still rely on.
+// Keep unused dependencies and kernel packages untouched
 Unattended-Upgrade::Remove-Unused-Dependencies "false";
 Unattended-Upgrade::Remove-Unused-Kernel-Packages "false";
 EOF
     chmod 0644 "$APT_LOCAL_UPGRADES"
     log_info "Wrote APT periodic and security-only drop-ins ($APT_AUTO_UPGRADES, $APT_LOCAL_UPGRADES)"
 
-    # Configure nightly timer overrides in /etc/systemd/system/<unit>.d/override.conf
     install -d -m 0755 "$TIMER_DAILY_DIR" "$TIMER_UPGRADE_DIR"
-    backup_if_Modified_or_existing "$TIMER_DAILY_CONF" "Managed by mail2hook install.sh"
-    backup_if_Modified_or_existing "$TIMER_UPGRADE_CONF" "Managed by mail2hook install.sh"
+    backup_if_unmanaged "$TIMER_DAILY_CONF" "Managed by mail2hook install.sh"
+    backup_if_unmanaged "$TIMER_UPGRADE_CONF" "Managed by mail2hook install.sh"
 
     cat > "$TIMER_DAILY_CONF" <<'EOF'
 # Managed by mail2hook install.sh
@@ -784,6 +892,40 @@ verify_unattended_upgrades() {
     fi
 }
 
+run_sendmail_e2e_test() {
+    local host_name
+    host_name="$(hostname 2>/dev/null || echo 'server')"
+
+    if [[ "$SENDMAIL_LINKED" -eq 1 ]]; then
+        log_info "Sending end-to-end test message through $SENDMAIL_PATH..."
+        local rc=0
+        if printf 'Subject: mail2hook install test on %s\nFrom: root\n\nmail2hook sendmail shim verification succeeded.\n' "$host_name" \
+            | "$SENDMAIL_PATH" -t -oi root; then
+            E2E_STATUS="passed (via $SENDMAIL_PATH)"
+            log_info "End-to-end sendmail test succeeded."
+        else
+            rc=$?
+            E2E_STATUS="failed (exit code ${rc})"
+            log_warn "End-to-end sendmail test failed with exit code ${rc}."
+            log_warn "Verify network access and the webhook URL in $ENV_FILE, then re-test with:"
+            log_warn "  echo \"Subject: test\" | sudo $SENDMAIL_PATH root"
+        fi
+    else
+        log_warn "Skipping $SENDMAIL_PATH end-to-end test because another MTA owns $SENDMAIL_PATH."
+        log_info "Testing $BIN_PATH directly instead..."
+        local rc=0
+        if printf 'Subject: mail2hook install test on %s\nFrom: root\n\nmail2hook direct invocation verification succeeded.\n' "$host_name" \
+            | "$BIN_PATH" -t -oi root; then
+            E2E_STATUS="passed (direct $BIN_PATH; $SENDMAIL_PATH unchanged)"
+            log_info "Direct $BIN_PATH test succeeded."
+        else
+            rc=$?
+            E2E_STATUS="failed (direct $BIN_PATH exit code ${rc})"
+            log_warn "Direct $BIN_PATH test failed with exit code ${rc}."
+        fi
+    fi
+}
+
 detect_timezone() {
     local tz=""
     if command -v timedatectl >/dev/null 2>&1 && is_systemd_running; then
@@ -809,9 +951,9 @@ detect_timezone() {
 print_summary() {
     local tz_info
     tz_info="$(detect_timezone)"
-    local svc_state="inactive (systemd not running)"
-    if is_systemd_running; then
-        svc_state="$(systemctl is-active mail2hook.service 2>/dev/null || echo 'unknown')"
+    local sendmail_summary="not linked (existing MTA preserved)"
+    if [[ "$SENDMAIL_LINKED" -eq 1 ]]; then
+        sendmail_summary="$SENDMAIL_PATH -> $BIN_PATH"
     fi
 
     printf '\n============================================================\n'
@@ -819,10 +961,10 @@ print_summary() {
     printf '============================================================\n'
     printf '  OS Detected      : %s (%s)\n' "$OS_PRETTY" "$OS_CODENAME"
     printf '  Server Timezone  : %s\n' "$tz_info"
-    printf '  Install Path     : %s\n' "$VENV_DIR"
-    printf '  Sendmail Drop-in : /usr/sbin/sendmail -> %s/bin/mail2hook\n' "$VENV_DIR"
-    printf '  Config File      : %s (root:%s, 0640)\n' "$ENV_FILE" "$SERVICE_GROUP"
-    printf '  SMTP Service     : mail2hook.service (%s, listening on 127.0.0.1:25)\n' "$svc_state"
+    printf '  Executable       : %s\n' "$BIN_PATH"
+    printf '  Sendmail Link    : %s\n' "$sendmail_summary"
+    printf '  Config File      : %s (root:%s, 0640)\n' "$ENV_FILE" "$ENV_GROUP"
+    printf '  End-to-End Test  : %s\n' "$E2E_STATUS"
     if [[ "$FLAG_SKIP_UPGRADES" -eq 0 ]]; then
         printf '  Auto-Upgrades    : Security updates only (Automatic-Reboot: false)\n'
         printf '  Download Window  : 01:00 - 02:00 local time (%s)\n' "$tz_info"
@@ -831,9 +973,8 @@ print_summary() {
         printf '  Auto-Upgrades    : Skipped (--skip-upgrades)\n'
     fi
     printf '\nUseful Commands:\n'
-    printf '  Service status   : sudo systemctl status mail2hook.service\n'
-    printf '  Service logs     : sudo journalctl -u mail2hook.service -f\n'
     printf '  Upgrade logs     : sudo tail -n 50 /var/log/unattended-upgrades/unattended-upgrades.log\n'
+    printf '  Test sendmail    : echo "Subject: test" | sudo sendmail root\n'
     printf '  Test dry-run     : printf "Subject: Test\\nFrom: root\\n\\nHello\\n" | sudo mail2hook --dry-run\n'
     printf '============================================================\n'
 
@@ -846,44 +987,29 @@ print_summary() {
 run_uninstall() {
     log_info "Uninstalling mail2hook..."
 
-    if is_systemd_running; then
-        systemctl stop mail2hook.service 2>/dev/null || true
-        systemctl disable mail2hook.service 2>/dev/null || true
-    fi
+    migrate_legacy_service
 
-    if [[ -f "$SERVICE_FILE" ]]; then
-        rm -f "$SERVICE_FILE"
-        log_info "Removed $SERVICE_FILE"
-        if is_systemd_running; then
-            systemctl daemon-reload
+    if command -v update-alternatives >/dev/null 2>&1; then
+        if update-alternatives --query mta 2>/dev/null | grep -Fq "$BIN_PATH"; then
+            update-alternatives --remove mta "$BIN_PATH"
+            log_info "Removed mail2hook from update-alternatives (mta)"
         fi
     fi
 
-    # Remove symlinks only if they point into /opt/mail2hook
     local link target
-    for link in /usr/local/bin/mail2hook /usr/sbin/sendmail /usr/bin/mailq; do
+    for link in "$SENDMAIL_PATH" "$MAILQ_PATH"; do
         if [[ -L "$link" ]]; then
             target="$(readlink "$link" || true)"
-            if [[ "$target" == "$INSTALL_DIR"* ]]; then
+            if [[ "$target" == "$BIN_PATH" ]]; then
                 rm -f "$link"
                 log_info "Removed symlink $link"
             fi
         fi
     done
 
-    if [[ -d "$INSTALL_DIR" ]]; then
-        rm -rf "$INSTALL_DIR"
-        log_info "Removed installation directory $INSTALL_DIR"
-    fi
-
-    if id -u "$SERVICE_USER" >/dev/null 2>&1; then
-        userdel "$SERVICE_USER" 2>/dev/null || true
-        log_info "Removed system user '$SERVICE_USER'"
-    fi
-
-    if getent group "$SERVICE_GROUP" >/dev/null 2>&1; then
-        groupdel "$SERVICE_GROUP" 2>/dev/null || true
-        log_info "Removed system group '$SERVICE_GROUP'"
+    if [[ -e "$BIN_PATH" || -L "$BIN_PATH" ]]; then
+        rm -f "$BIN_PATH"
+        log_info "Removed executable $BIN_PATH"
     fi
 
     if [[ -d "$CONFIG_DIR" || -f "$ENV_FILE" ]]; then
@@ -922,14 +1048,14 @@ main() {
         return 0
     fi
 
-    RESOLVED_WEBHOOK_URL=""
+    migrate_legacy_service
     resolve_webhook_url
     install_system_packages
-    ensure_service_user
-    install_mail2hook_venv
+    install_mail2hook_binary
+    configure_sendmail_link
     write_env_file
-    install_systemd_service
     configure_unattended_upgrades
+    run_sendmail_e2e_test
     print_summary
 }
 
