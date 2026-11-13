@@ -312,3 +312,17 @@ def test_extract_package_versions_apt_and_new_unpack() -> None:
     versions = extract_package_versions(text)
     assert versions["new-dep"] == (None, "1.0.0-1")
     assert versions["tzdata"] == ("2024a-0ubuntu0.24.04", "2024a-0ubuntu0.24.04.1")
+
+
+def test_parse_email_to_header_and_fallback() -> None:
+    msg_with_to = parse_email(
+        b"From: root@example.com\nTo: admin@example.com\nSubject: Hi\n\nBody\n",
+        fallback_to="ignored@example.com",
+    )
+    assert msg_with_to.to == "admin@example.com"
+
+    msg_without_to = parse_email(
+        b"From: root@example.com\nSubject: Hi\n\nBody\n",
+        fallback_to="root",
+    )
+    assert msg_without_to.to == "root"

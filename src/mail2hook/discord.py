@@ -20,11 +20,15 @@ from mail2hook.parse import ParsedMessage, truncate_text
 
 logger = logging.getLogger(__name__)
 
-# Discord embed limits
+# Discord webhook and embed limits
+MAX_CONTENT_CHARS = 2000
 MAX_TITLE_CHARS = 256
 MAX_DESCRIPTION_CHARS = 4096
 MAX_FIELD_NAME_CHARS = 256
 MAX_FIELD_VALUE_CHARS = 1024
+MAX_AUTHOR_NAME_CHARS = 256
+MAX_FOOTER_TEXT_CHARS = 2048
+MAX_EMBED_TOTAL_CHARS = 6000
 
 # Colors (decimal)
 COLOR_SUCCESS = 0x57F287  # Green
@@ -229,7 +233,7 @@ def build_payload(msg: ParsedMessage, config: Config) -> dict[str, Any]:
         fields.append(
             {
                 "name": "Reboot",
-                "value": reboot_value,
+                "value": truncate_text(reboot_value, MAX_FIELD_VALUE_CHARS),
                 "inline": True,
             }
         )
@@ -242,6 +246,15 @@ def build_payload(msg: ParsedMessage, config: Config) -> dict[str, Any]:
             "inline": True,
         }
     )
+
+    if msg.to:
+        fields.append(
+            {
+                "name": "To",
+                "value": truncate_text(msg.to, MAX_FIELD_VALUE_CHARS),
+                "inline": True,
+            }
+        )
 
     if msg.date:
         fields.append(
@@ -262,7 +275,7 @@ def build_payload(msg: ParsedMessage, config: Config) -> dict[str, Any]:
     fields.append(
         {
             "name": "Server Logs",
-            "value": log_reminder,
+            "value": truncate_text(log_reminder, MAX_FIELD_VALUE_CHARS),
             "inline": False,
         }
     )
@@ -270,20 +283,37 @@ def build_payload(msg: ParsedMessage, config: Config) -> dict[str, Any]:
     footer_text = f"mail2hook • {hostname}" if hostname else "mail2hook"
     if os_info:
         footer_text = f"{footer_text} ({os_info})"
+    footer_text = truncate_text(footer_text, MAX_FOOTER_TEXT_CHARS)
+
+    title_text = truncate_text(msg.subject, MAX_TITLE_CHARS)
+
+    author_name: str | None = None
+    if hostname:
+        author_raw = f"Server: {hostname}"
+        if os_info:
+            author_raw += f" • {os_info}"
+        author_name = truncate_text(author_raw, MAX_AUTHOR_NAME_CHARS)
+
+    # Enforce Discord's 6000-character total limit across all embed text fields
+    overhead = (
+        len(title_text)
+        + len(footer_text)
+        + (len(author_name) if author_name else 0)
+        + sum(len(f["name"]) + len(f["value"]) for f in fields)
+    )
+    available_desc = max(1, MAX_EMBED_TOTAL_CHARS - overhead)
+    desc = truncate_text(desc, available_desc)
 
     embed: dict[str, Any] = {
-        "title": truncate_text(msg.subject, MAX_TITLE_CHARS),
+        "title": title_text,
         "description": desc,
         "color": color,
         "fields": fields,
-        "footer": {"text": truncate_text(footer_text, 2048)},
+        "footer": {"text": footer_text},
     }
 
-    if hostname:
-        author_text = f"Server: {hostname}"
-        if os_info:
-            author_text += f" • {os_info}"
-        embed["author"] = {"name": author_text}
+    if author_name:
+        embed["author"] = {"name": author_name}
 
     return {
         "username": config.discord_username,

@@ -52,6 +52,7 @@ class ParsedMessage:
     subject: str
     date: str
     body: str
+    to: str = ""
     status: str = "info"  # "success", "failure", or "info"
     hostname: str | None = None
     reboot_required: bool = False
@@ -766,6 +767,7 @@ def parse_email(
     max_body_chars: int = 1500,
     *,
     fallback_sender: str | None = None,
+    fallback_to: str | None = None,
     check_system_reboot: bool = True,
     dpkg_log_paths: Sequence[Path] = DEFAULT_DPKG_LOG_PATHS,
 ) -> ParsedMessage:
@@ -785,6 +787,14 @@ def parse_email(
         sender = fallback_sender.strip()
     else:
         sender = "(unknown sender)"
+
+    raw_to = msg.get("To")
+    if raw_to and str(raw_to).strip():
+        to_addr = str(raw_to).strip()
+    elif fallback_to and fallback_to.strip():
+        to_addr = fallback_to.strip()
+    else:
+        to_addr = ""
 
     subject = str(msg.get("Subject", "(no subject)"))
     date = str(msg.get("Date", ""))
@@ -819,6 +829,7 @@ def parse_email(
         subject=subject,
         date=date,
         body=body,
+        to=to_addr,
         status=status,
         hostname=hostname,
         reboot_required=reboot_required,

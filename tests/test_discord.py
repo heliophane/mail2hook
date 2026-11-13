@@ -304,3 +304,31 @@ def test_post_to_discord_permanent_error_404(mock_urlopen: MagicMock) -> None:
 
     # Permanent error should not be retried
     assert mock_urlopen.call_count == 1
+
+
+def test_build_payload_to_field_and_total_embed_limit() -> None:
+    config = Config(discord_webhook_url=FAKE_WEBHOOK_URL, max_body_chars=8000)
+    msg = ParsedMessage(
+        sender="root@server01.example.com",
+        to="ops@example.com",
+        subject="S" * 300,
+        date="Wed, 11 Nov 2026 12:00:00 +0000",
+        body="X" * 7000,
+        status="info",
+        hostname="H" * 300,
+    )
+    payload = build_payload(msg, config)
+    embed = payload["embeds"][0]
+    to_field = next(f for f in embed["fields"] if f["name"] == "To")
+    assert to_field["value"] == "ops@example.com"
+    assert len(embed["title"]) <= 256
+    assert len(embed["description"]) <= 4096
+    assert len(embed["author"]["name"]) <= 256
+    total_chars = (
+        len(embed["title"])
+        + len(embed["description"])
+        + len(embed["author"]["name"])
+        + len(embed["footer"]["text"])
+        + sum(len(f["name"]) + len(f["value"]) for f in embed["fields"])
+    )
+    assert total_chars <= 6000

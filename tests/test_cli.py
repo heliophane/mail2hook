@@ -211,6 +211,8 @@ def test_cli_sendmail_envelope_sender_and_dot_eof(monkeypatch: pytest.MonkeyPatc
     assert "Ignored after single dot" not in embed["description"]
     from_field = next(f for f in embed["fields"] if f["name"] == "From")
     assert "Cron Daemon (root@server01.example.com)" == from_field["value"]
+    to_field = next(f for f in embed["fields"] if f["name"] == "To")
+    assert to_field["value"] == "root"
 
 
 def test_cli_oversized_input(

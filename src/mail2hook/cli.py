@@ -269,11 +269,15 @@ def run(argv: list[str] | None = None) -> int:
 
     # 3. Parse email
     fallback_sender = _build_fallback_sender(args)
+    fallback_to = (
+        ", ".join(r.strip() for r in args.recipients if r.strip()) if args.recipients else None
+    )
     try:
         msg = parse_email(
             raw_bytes,
             max_body_chars=config.max_body_chars,
             fallback_sender=fallback_sender,
+            fallback_to=fallback_to,
         )
     except ParseError as err:
         sys.stderr.write(f"mail2hook: unparseable email data: {err}\n")
