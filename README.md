@@ -46,7 +46,85 @@ Specifically designed for automated system notifications:
 
 For a complete multi-server deployment walkthrough, see [docs/MULTI_SERVER_SETUP.md](docs/MULTI_SERVER_SETUP.md).
 
-### Step 1: Install prerequisites & remove existing MTAs
+### Quick Start: Automated One-Line Installer (`install.sh`)
+
+On a fresh Debian or Ubuntu server, run `install.sh` to install `mail2hook`, configure the locked-down `mail2hook.service` SMTP daemon and `/usr/sbin/sendmail` drop-in, prompt for your Discord webhook (via `/dev/tty`), and configure conservative, nightly **security-only** `unattended-upgrades`:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/heliophane/mail2hook/main/install.sh | sudo bash
+```
+
+#### Supported Operating Systems
+
+| OS | Codename | Default Python | APT Sources Format | Security Origin Configuration |
+| :--- | :--- | :--- | :--- | :--- |
+| **Debian 12** | `bookworm` | Python 3.11 | DEB822 (`debian.sources`) / `.list` | `Unattended-Upgrade::Origins-Pattern` (`label=Debian-Security`) |
+| **Debian 13** | `trixie` | Python 3.13 | DEB822 (`debian.sources`) | `Unattended-Upgrade::Origins-Pattern` (`label=Debian-Security`) |
+| **Ubuntu 24.04 LTS** | `noble` | Python 3.12 | DEB822 (`ubuntu.sources`) | `Unattended-Upgrade::Allowed-Origins` (`${distro_id}:${distro_codename}-security`) |
+| **Ubuntu 26.04 LTS** | `resolute` | Python 3.14 | DEB822 (`ubuntu.sources`) | `Unattended-Upgrade::Allowed-Origins` (`${distro_id}:${distro_codename}-security`) |
+
+#### Installer Flags
+
+| Flag | Description |
+| :--- | :--- |
+| `--webhook-url <url>` | Provide the Discord webhook URL directly (also reads `DISCORD_WEBHOOK_URL` from the environment). |
+| `--skip-upgrades` | Install `mail2hook` only; skip installing and configuring `unattended-upgrades`. |
+| `--yes`, `-y` | Non-interactive mode; accept defaults and never prompt. |
+| `--uninstall` | Remove `mail2hook.service`, service user, symlinks, and `/opt/mail2hook` (leaves `unattended-upgrades` in place unless `--purge-upgrades` is passed). |
+| `--purge-upgrades` | Used with `--uninstall` to also remove the `unattended-upgrades` drop-in files and systemd timer overrides. |
+| `--help`, `-h` | Display usage information and exit. |
+
+#### Non-Interactive Installation
+
+Pass the webhook via `--webhook-url` or `DISCORD_WEBHOOK_URL` alongside `--yes`:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/heliophane/mail2hook/main/install.sh | sudo bash -s -- \
+  --webhook-url "https://discord.com/api/webhooks/123456789012345678/example-token-placeholder" \
+  --yes
+```
+
+Or from a local checkout:
+
+```bash
+sudo DISCORD_WEBHOOK_URL="https://discord.com/api/webhooks/123456789012345678/example-token-placeholder" ./install.sh --yes
+```
+
+#### Checking Upgrade Logs & Pending Reboots
+
+- **View `unattended-upgrades` logs**:
+  ```bash
+  sudo tail -n 50 /var/log/unattended-upgrades/unattended-upgrades.log
+  sudo tail -n 50 /var/log/unattended-upgrades/unattended-upgrades-dpkg.log
+  ```
+- **Check if a system reboot is pending** (`Automatic-Reboot` is disabled by default so servers never reboot unexpectedly):
+  ```bash
+  if [ -f /var/run/reboot-required ]; then
+    cat /var/run/reboot-required
+    cat /var/run/reboot-required.pkgs 2>/dev/null || true
+  fi
+  ```
+- **Note on `mail2hook` dependency updates**: Security upgrades to `mail2hook`'s runtime dependencies (such as system `python3` or `libssl`) take effect for the background `mail2hook.service` daemon on the next service restart (`sudo systemctl restart mail2hook.service`). Direct `/usr/sbin/sendmail` invocations spawn a new process on each run.
+
+#### Updating & Uninstalling
+
+- **Update `mail2hook`**: Re-run `sudo ./install.sh --yes` (it is idempotent and preserves your existing `/etc/mail2hook/env` settings), or upgrade the package directly and restart the service:
+  ```bash
+  sudo /opt/mail2hook/venv/bin/pip install --upgrade git+https://github.com/heliophane/mail2hook.git
+  sudo systemctl restart mail2hook.service
+  ```
+- **Uninstall `mail2hook`**:
+  ```bash
+  sudo ./install.sh --uninstall
+  # Or also remove the unattended-upgrades drop-ins and timer overrides:
+  sudo ./install.sh --uninstall --purge-upgrades
+  ```
+
+---
+
+### Manual Installation
+
+#### Step 1: Install prerequisites & remove existing MTAs
 
 Install Python virtual environment tools and remove any conflicting Mail Transfer Agents (`postfix`, `exim4`, etc.):
 
