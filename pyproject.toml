@@ -12,14 +12,10 @@ authors = [
     { name = "mail2hook maintainers" }
 ]
 license = "MIT"
-dependencies = [
-    "python-dotenv>=1.0.0",
-]
+dependencies = []
 
 [project.scripts]
 mail2hook = "mail2hook.cli:main"
-sendmail = "mail2hook.cli:main"
-mailq = "mail2hook.cli:main"
 
 [project.optional-dependencies]
 dev = [

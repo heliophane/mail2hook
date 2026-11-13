@@ -8,8 +8,6 @@ from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from dotenv import dotenv_values
-
 DEFAULT_SYSTEM_ENV_PATH = Path("/etc/mail2hook/env")
 DEFAULT_MAX_BODY_CHARS = 1500
 DEFAULT_DISCORD_USERNAME = "mail2hook"
@@ -58,24 +56,47 @@ def validate_webhook_url(url: str | None) -> str:
     return cleaned
 
 
+def _strip_inline_comment(value: str) -> str:
+    """Strip unquoted inline comments and surrounding matching quotes from an env value."""
+    val = value.strip()
+    if not val:
+        return ""
+    if (val.startswith('"') and val.endswith('"') and len(val) >= 2) or (
+        val.startswith("'") and val.endswith("'") and len(val) >= 2
+    ):
+        return val[1:-1]
+    if " #" in val:
+        val = val.split(" #", 1)[0].strip()
+    return val
+
+
 def _safe_load_dotenv(path: Path) -> dict[str, str]:
-    """Safely load variables from a dotenv file, giving a clear message on permission errors."""
+    """Safely load variables from a KEY=VALUE env file without external dependencies."""
     try:
-        loaded = dotenv_values(path)
-        result: dict[str, str] = {}
-        for k, v in loaded.items():
-            if v is not None:
-                result[k] = v
-            elif k and ("discord.com/api/webhooks/" in k or "discordapp.com/api/webhooks/" in k):
-                # The user pasted the bare webhook URL directly without key= prefix
-                result["DISCORD_WEBHOOK_URL"] = k.strip()
-        return result
+        raw_text = path.read_text(encoding="utf-8", errors="replace")
     except PermissionError as err:
         raise ConfigError(
             f"Permission denied reading configuration file '{path}'. "
             f"Ensure the running user has read access "
-            f"(e.g. sudo chown root:<group> {path} && sudo chmod 0640 {path})"
+            f"(e.g. sudo chown root:mail {path} && sudo chmod 0640 {path})"
         ) from err
+
+    result: dict[str, str] = {}
+    for raw_line in raw_text.splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("export "):
+            line = line[len("export ") :].strip()
+        if "=" in line:
+            key, value = line.split("=", 1)
+            key = key.strip()
+            if key:
+                result[key] = _strip_inline_comment(value)
+        elif "discord.com/api/webhooks/" in line or "discordapp.com/api/webhooks/" in line:
+            # The user pasted the bare webhook URL directly without key= prefix
+            result["DISCORD_WEBHOOK_URL"] = line
+    return result
 
 
 def load_config(
