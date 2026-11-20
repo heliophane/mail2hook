@@ -12,6 +12,7 @@ from mail2hook.config import (
     DEFAULT_MAX_BODY_CHARS,
     ConfigError,
     load_config,
+    validate_discord_username,
     validate_webhook_url,
 )
 
@@ -170,3 +171,115 @@ def test_load_config_directory_eacces_surfaces_permission_error(
     finally:
         locked_dir.chmod(0o755)
         env_file.chmod(0o644)
+
+
+def test_load_config_explicit_env_file_missing_and_directory_errors(tmp_path: Path) -> None:
+    missing_env = tmp_path / "does-not-exist.env"
+    with pytest.raises(ConfigError, match="Configuration file not found or unreadable"):
+        load_config(env_file=missing_env, environ={"DISCORD_WEBHOOK_URL": VALID_WEBHOOK_URL})
+
+    dir_env = tmp_path / "env_dir"
+    dir_env.mkdir()
+    with pytest.raises(ConfigError, match="Configuration file not found or unreadable"):
+        load_config(env_file=dir_env, environ={"DISCORD_WEBHOOK_URL": VALID_WEBHOOK_URL})
+
+
+def test_load_config_blocks_cwd_dotenv_when_system_env_present_or_root(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cwd_dir = tmp_path / "cwd"
+    cwd_dir.mkdir()
+    monkeypatch.chdir(cwd_dir)
+    cwd_dotenv = cwd_dir / ".env"
+    cwd_dotenv.write_text(
+        f"DISCORD_WEBHOOK_URL={VALID_CANARY_WEBHOOK_URL}\n"
+        "DISCORD_USERNAME=InjectedBot\n"
+        "SERVER_NAME=injected.example.com\n",
+        encoding="utf-8",
+    )
+
+    # 1. System env exists & readable -> .env must NOT be loaded or inject defaults
+    sys_env = tmp_path / "system_env"
+    sys_env.write_text(f"DISCORD_WEBHOOK_URL={VALID_WEBHOOK_URL}\n", encoding="utf-8")
+    monkeypatch.setattr("mail2hook.config.DEFAULT_SYSTEM_ENV_PATH", sys_env)
+    cfg = load_config(load_default_files=True, environ={})
+    assert cfg.discord_webhook_url == VALID_WEBHOOK_URL
+    assert cfg.discord_username == DEFAULT_DISCORD_USERNAME
+    assert cfg.server_name is None
+
+    # 1b. System env exists without webhook -> .env must STILL NOT supply webhook
+    sys_env.write_text("SERVER_NAME=system-only.example.com\n", encoding="utf-8")
+    with pytest.raises(ConfigError, match="Missing required environment variable"):
+        load_config(load_default_files=True, environ={})
+
+    # 2. System env unreadable (EACCES) -> .env must NOT be loaded; permission error surfaces
+    if not (hasattr(os, "geteuid") and os.geteuid() == 0):
+        locked_dir = tmp_path / "locked_sys"
+        locked_dir.mkdir(mode=0o755)
+        locked_env = locked_dir / "env"
+        locked_env.write_text(f"DISCORD_WEBHOOK_URL={VALID_WEBHOOK_URL}\n", encoding="utf-8")
+        locked_dir.chmod(0o000)
+        try:
+            monkeypatch.setattr("mail2hook.config.DEFAULT_SYSTEM_ENV_PATH", locked_env)
+            with pytest.raises(ConfigError, match="Permission denied reading configuration file"):
+                load_config(load_default_files=True, environ={})
+        finally:
+            locked_dir.chmod(0o755)
+
+    # 3. System env absent + running as root -> .env must NOT be loaded
+    monkeypatch.setattr("mail2hook.config.DEFAULT_SYSTEM_ENV_PATH", tmp_path / "absent_env")
+    monkeypatch.setattr("mail2hook.config._is_running_as_root", lambda: True)
+    with pytest.raises(ConfigError, match="Missing required environment variable"):
+        load_config(load_default_files=True, environ={})
+
+    # 4. System env absent + non-root -> .env loads for local development
+    monkeypatch.setattr("mail2hook.config._is_running_as_root", lambda: False)
+    local_cfg = load_config(load_default_files=True, environ={})
+    assert local_cfg.discord_webhook_url == VALID_CANARY_WEBHOOK_URL
+    assert local_cfg.discord_username == "InjectedBot"
+
+
+def test_load_config_quoted_values_with_inline_comments(tmp_path: Path) -> None:
+    env_file = tmp_path / "comments_env"
+    env_file.write_text(
+        f'DISCORD_WEBHOOK_URL="{VALID_WEBHOOK_URL}" # comment with "quotes"\n'
+        "DISCORD_USERNAME='MyBot#1'\t# tab comment with 'quote'\n"
+        'SERVER_NAME="web#01" # keep hash inside quotes\n'
+        "FILTER_SENDERS=root@example.com\t# tab inline comment\n"
+        'FILTER_SUBJECT_KEYWORDS="" # empty quoted string\n',
+        encoding="utf-8",
+    )
+    cfg = load_config(env_file=env_file, environ={})
+    assert cfg.discord_webhook_url == VALID_WEBHOOK_URL
+    assert cfg.discord_username == "MyBot#1"
+    assert cfg.server_name == "web#01"
+    assert cfg.filter_senders == ["root@example.com"]
+    assert cfg.filter_subject_keywords == []
+
+    bare_env = tmp_path / "bare_comment_env"
+    bare_env.write_text(f"{VALID_WEBHOOK_URL} # pasted webhook with note\n", encoding="utf-8")
+    bare_cfg = load_config(env_file=bare_env, environ={})
+    assert bare_cfg.discord_webhook_url == VALID_WEBHOOK_URL
+
+
+def test_validate_discord_username() -> None:
+    assert validate_discord_username(None) == DEFAULT_DISCORD_USERNAME
+    assert validate_discord_username("   ") == DEFAULT_DISCORD_USERNAME
+    assert validate_discord_username("there") == "there"
+    assert validate_discord_username("everyone-bot") == "everyone-bot"
+    assert validate_discord_username("A" * 80) == "A" * 80
+
+    for invalid in (
+        "A" * 81,
+        "My Discord Hook",
+        "Clyde-Notifier",
+        "bad```name",
+        "everyone",
+        "EVERYONE",
+        "here",
+        "Here",
+        "@everyone",
+        "@here",
+    ):
+        with pytest.raises(ConfigError, match="Invalid DISCORD_USERNAME"):
+            validate_discord_username(invalid)

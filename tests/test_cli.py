@@ -516,3 +516,14 @@ def test_cli_filtered_out_visible_under_verbose_and_dry_run(
     caplog.set_level(logging.INFO)
     assert run(["--file", fixture_path, "-v"]) == EXIT_OK
     assert "Filtered out message" in caplog.text
+
+
+def test_cli_missing_env_file_exits_config(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], tmp_path: Path
+) -> None:
+    monkeypatch.setenv("DISCORD_WEBHOOK_URL", VALID_WEBHOOK_URL)
+    missing_env = tmp_path / "missing.env"
+    code = run(["--env-file", str(missing_env)])
+    captured = capsys.readouterr()
+    assert code == EXIT_CONFIG
+    assert "Configuration file not found or unreadable" in captured.err
