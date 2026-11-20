@@ -1734,6 +1734,7 @@ print_summary() {
         fi
     fi
     printf '\nUseful Commands:\n'
+    printf '  Diagnostics      : sudo mail2hook --doctor\n'
     printf '  Upgrade logs     : sudo tail -n 50 /var/log/unattended-upgrades/unattended-upgrades.log\n'
     if [[ "$INSTALL_MODE" == "postfix-pipe" ]]; then
         printf '  Test Postfix     : printf "To: %s\\nFrom: root\\nSubject: unattended-upgrades test\\n\\nHello\\n" | sudo sendmail -oi -t\n' "$POSTFIX_RECIPIENT"

@@ -177,6 +177,8 @@ printf 'Subject: unattended-upgrades test\nFrom: root\n\nHello\n' | sudo mail2ho
 - `--dry-run`: Print the Discord JSON payload to `stdout` without sending.
 - `--env-file PATH`: Use a custom env file instead of `/etc/mail2hook/env` or `.env`.
 - `--print-apt-config`: Print the recommended `/etc/apt/apt.conf.d/52mail2hook` snippet and exit.
+- `--doctor`: Print installation diagnostics (sendmail owner, Postfix route, env readability, redacted webhook ID, APT mail settings, installed MTAs, and sample dry-run) without exposing secrets.
+- `--doctor --send-test`: Run diagnostics and post a clearly labeled test message to Discord.
 - `--version`, `-V`: Show version and exit.
 - Sendmail compatibility flags: `-t`, `-i`, `-oi`, `-bm`, `-bp`, `-bv`, `-bs`, `-f`, `-r`, `-F`, `-B`, `-v`, `-o...`, and positional recipient arguments.
 

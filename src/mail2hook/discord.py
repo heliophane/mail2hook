@@ -13,6 +13,7 @@ import urllib.request
 from email.utils import parseaddr
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
 from mail2hook import __version__
 from mail2hook.config import Config
@@ -57,12 +58,55 @@ def _sanitize_inline_code(value: str) -> str:
     return re.sub(r"[`\r\n]+", "", value).strip()
 
 
+_WEBHOOK_ID_RE = re.compile(r"/api/(?:v\d+/)?webhooks/(\d+)(?:/|$)")
+_WEBHOOK_SECRET_RE = re.compile(
+    r"(https?://(?:[^/\s@]+@)?[^\s/]+/api/(?:v\d+/)?webhooks/\d+/)([^\s/?#\"'>]+)"
+)
+_URL_USERINFO_RE = re.compile(r"(https?://)([^/\s@]+)@")
+
+
 def redact_webhook_url(url: str) -> str:
     """Mask the secret token part of a Discord webhook URL for safe logging."""
     parts = url.rstrip("/").split("/")
     if len(parts) >= 2 and parts[-2].isdigit():
         return f"{'/'.join(parts[:-1])}/[REDACTED]"
     return "[REDACTED_WEBHOOK_URL]"
+
+
+def extract_webhook_id(url: str | None) -> str | None:
+    """Return the numeric Discord webhook ID without exposing its token."""
+    if not url:
+        return None
+    try:
+        path = urlsplit(url.strip()).path
+    except ValueError:
+        return None
+    match = _WEBHOOK_ID_RE.search(path)
+    return match.group(1) if match else None
+
+
+def redact_secrets(text: str, webhook_url: str | None = None) -> str:
+    """Redact webhook URLs, tokens, and URL credentials from text."""
+    if not text:
+        return text
+    result = text
+    if webhook_url:
+        stripped = webhook_url.strip()
+        if stripped:
+            masked = redact_webhook_url(stripped)
+            base_only = stripped.split("?", 1)[0].split("#", 1)[0]
+            for candidate in (stripped, stripped.rstrip("/"), base_only, base_only.rstrip("/")):
+                if candidate:
+                    result = result.replace(candidate, masked)
+            try:
+                path_parts = [p for p in urlsplit(stripped).path.split("/") if p]
+            except ValueError:
+                path_parts = []
+            if len(path_parts) >= 2 and path_parts[-2].isdigit() and len(path_parts[-1]) >= 16:
+                result = result.replace(path_parts[-1], "[REDACTED]")
+    result = _WEBHOOK_SECRET_RE.sub(r"\1[REDACTED]", result)
+    result = _URL_USERINFO_RE.sub(r"\1[REDACTED]@", result)
+    return result
 
 
 def format_sender(sender: str, hostname: str | None) -> str:

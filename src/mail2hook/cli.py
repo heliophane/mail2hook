@@ -20,6 +20,7 @@ from mail2hook.discord import (
     build_payload,
     post_to_discord,
 )
+from mail2hook.doctor import run_doctor
 from mail2hook.filters import should_process_message
 from mail2hook.parse import ParseError, parse_email
 
@@ -100,6 +101,16 @@ def build_parser() -> argparse.ArgumentParser:
         "--print-apt-config",
         action="store_true",
         help="Print recommended /etc/apt/apt.conf.d/52mail2hook configuration and exit.",
+    )
+    parser.add_argument(
+        "--doctor",
+        action="store_true",
+        help="Run diagnostic checks and exit without reading email from stdin.",
+    )
+    parser.add_argument(
+        "--send-test",
+        action="store_true",
+        help="With --doctor, post a clearly labeled diagnostic test message to Discord.",
     )
     parser.add_argument(
         "--version",
@@ -294,6 +305,13 @@ def run(argv: list[str] | None = None) -> int:
 
     if getattr(args, "verbose", False):
         logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
+
+    if args.send_test and not args.doctor:
+        sys.stderr.write("mail2hook: --send-test requires --doctor\n")
+        return EXIT_CONFIG
+
+    if args.doctor:
+        return run_doctor(env_file=args.env_file, send_test=args.send_test)
 
     # 1. Load and validate configuration
     try:

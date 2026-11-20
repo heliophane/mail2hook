@@ -46,5 +46,5 @@ All config is via environment variables (see `.env.example`):
 
 - Keep it small and readable. Prefer simple functions over classes.
 - Type hints on all functions. Format with `ruff format`, lint with `ruff check`.
-- Modules: `config.py`, `parse.py`, `filters.py`, `discord.py`, `cli.py`.
+- Modules: `config.py`, `parse.py`, `filters.py`, `discord.py`, `doctor.py`, `cli.py`.
 - Run `ruff check .`, `ruff format --check .`, `pytest`, and `shellcheck install.sh` before committing.
