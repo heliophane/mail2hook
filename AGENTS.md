@@ -17,7 +17,7 @@ This repo is **public**. Never commit secrets or personal data.
 ## How it is deployed
 
 - Installed as a standalone executable at `/usr/local/bin/mail2hook`, registered via `update-alternatives` (`mta` -> `/usr/sbin/sendmail`, slave `mta-mailq` -> `/usr/bin/mailq`) when no conflicting MTA is present.
-- Config is read from `/etc/mail2hook/env` (`root:mail`, mode `0640`), `--env-file PATH`, `.env`, or environment variables.
+- Config is read from `/etc/mail2hook/env` (`root:mail`, mode `0640`), `--env-file PATH`, `.env` (non-root local dev only when `/etc/mail2hook/env` is absent), or environment variables.
 - Installable via `install.sh`, `pip install .`, or `pipx install .`.
 
 ## Security rules (highest priority)
@@ -46,5 +46,5 @@ All config is via environment variables (see `.env.example`):
 
 - Keep it small and readable. Prefer simple functions over classes.
 - Type hints on all functions. Format with `ruff format`, lint with `ruff check`.
-- Modules: `config.py`, `parse.py`, `filters.py`, `discord.py`, `cli.py`.
+- Modules: `config.py`, `parse.py`, `filters.py`, `discord.py`, `doctor.py`, `cli.py`.
 - Run `ruff check .`, `ruff format --check .`, `pytest`, and `shellcheck install.sh` before committing.

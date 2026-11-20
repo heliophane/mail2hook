@@ -8,6 +8,7 @@
 #   - Ubuntu 26.04 LTS (resolute)
 
 set -euo pipefail
+umask 022
 
 readonly REPO_URL="https://github.com/heliophane/mail2hook"
 readonly API_RELEASES_URL="https://api.github.com/repos/heliophane/mail2hook/releases/latest"
@@ -16,6 +17,17 @@ readonly SENDMAIL_PATH="/usr/sbin/sendmail"
 readonly MAILQ_PATH="/usr/bin/mailq"
 readonly CONFIG_DIR="/etc/mail2hook"
 readonly ENV_FILE="/etc/mail2hook/env"
+readonly BACKUP_DIR="/var/backups/mail2hook"
+
+# Postfix pipe integration paths and identifiers
+readonly POSTFIX_MAIN_CF="/etc/postfix/main.cf"
+readonly POSTFIX_MASTER_CF="/etc/postfix/master.cf"
+readonly POSTFIX_TRANSPORT_FILE="/etc/postfix/mail2hook_transport"
+readonly POSTFIX_TRANSPORT_NAME="mail2hook"
+readonly POSTFIX_RECIPIENT="mail2hook@localhost"
+readonly POSTFIX_PIPE_USER="nobody"
+readonly POSTFIX_MASTER_BEGIN="# BEGIN mail2hook managed block"
+readonly POSTFIX_MASTER_END="# END mail2hook managed block"
 
 # Legacy layout paths from earlier service-based versions (used for clean migration)
 readonly LEGACY_INSTALL_DIR="/opt/mail2hook"
@@ -28,6 +40,10 @@ readonly LEGACY_SERVICE_WANT="/etc/systemd/system/multi-user.target.wants/mail2h
 readonly APT_AUTO_UPGRADES="/etc/apt/apt.conf.d/20auto-upgrades"
 readonly APT_LOCAL_UPGRADES="/etc/apt/apt.conf.d/52-unattended-upgrades-local"
 readonly APT_LEGACY_MAIL2HOOK="/etc/apt/apt.conf.d/52mail2hook"
+readonly APT_MAIL_ORIG_BACKUP="${BACKUP_DIR}/apt_mail_target.orig"
+readonly DEFAULT_SUBJECT_FILTER="unattended-upgrades"
+readonly E2E_MARKER_DIR="/run/mail2hook"
+readonly E2E_MARKER_FILE="/run/mail2hook/e2e-confirm"
 readonly TIMER_DAILY_DIR="/etc/systemd/system/apt-daily.timer.d"
 readonly TIMER_DAILY_CONF="/etc/systemd/system/apt-daily.timer.d/override.conf"
 readonly TIMER_UPGRADE_DIR="/etc/systemd/system/apt-daily-upgrade.timer.d"
@@ -51,7 +67,37 @@ OS_PRETTY=""
 ENV_GROUP="mail"
 RESOLVED_WEBHOOK_URL=""
 SENDMAIL_LINKED=0
+INSTALL_MODE=""
+DETECTED_MTAS=""
+UPGRADE_MAIL_TARGET="root"
+PREVIOUS_UPGRADE_MAIL_TARGET=""
+ACTIVE_SUBJECT_FILTER=""
 E2E_STATUS="not run"
+E2E_FAILED=0
+E2E_FAILURE_REASON=""
+
+declare -a CLEANUP_PATHS=()
+declare -a CHANGES_MADE=()
+declare -a BACKUPS_CREATED=()
+
+register_cleanup_path() {
+    CLEANUP_PATHS+=("$1")
+}
+
+cleanup_temp_files() {
+    local p
+    for p in "${CLEANUP_PATHS[@]+"${CLEANUP_PATHS[@]}"}"; do
+        if [[ -n "$p" && -e "$p" ]]; then
+            rm -rf "$p" 2>/dev/null || true
+        fi
+    done
+}
+
+trap cleanup_temp_files EXIT INT TERM
+
+record_change() {
+    CHANGES_MADE+=("$1")
+}
 
 log_info() {
     printf '[INFO] %s\n' "$*"
@@ -69,20 +115,24 @@ usage() {
     cat <<'EOF'
 Usage: install.sh [OPTIONS]
 
-Install mail2hook as a lightweight sendmail shim and configure conservative,
-security-only unattended-upgrades on Debian 12/13 and Ubuntu 24.04/26.04.
+Install mail2hook and configure conservative, security-only unattended-upgrades
+on Debian 12/13 and Ubuntu 24.04/26.04. When Postfix is installed, mail2hook
+integrates via a dedicated pipe transport without replacing /usr/sbin/sendmail.
 
 Options:
-  --webhook-url <url>   Set Discord webhook URL (or pass DISCORD_WEBHOOK_URL env var)
   --skip-upgrades       Skip installing and configuring unattended-upgrades
-  --uninstall           Remove mail2hook executable and sendmail link/alternative
+  --uninstall           Remove mail2hook, Postfix integration, and sendmail alternative
   --purge-upgrades      With --uninstall, also remove unattended-upgrades drop-ins and timer overrides
   --yes, -y             Non-interactive mode; accept defaults and do not prompt
   --help, -h            Show this help message and exit
 
+Environment:
+  DISCORD_WEBHOOK_URL   Discord webhook URL for non-interactive setup (avoids CLI secrets)
+
 Examples:
   curl -fsSL https://raw.githubusercontent.com/heliophane/mail2hook/main/install.sh | sudo bash
-  sudo ./install.sh --webhook-url "https://discord.com/api/webhooks/..." --yes
+  export DISCORD_WEBHOOK_URL="https://discord.com/api/webhooks/..."
+  sudo --preserve-env=DISCORD_WEBHOOK_URL bash ./install.sh --yes
   sudo ./install.sh --uninstall
 EOF
 }
@@ -95,6 +145,7 @@ parse_args() {
                     log_error "--webhook-url requires a non-empty URL argument."
                     exit 1
                 fi
+                log_warn "--webhook-url is deprecated and exposes secrets in process listings (ps); pass DISCORD_WEBHOOK_URL via environment or pre-create $ENV_FILE instead."
                 FLAG_WEBHOOK_URL="$2"
                 shift 2
                 ;;
@@ -104,6 +155,7 @@ parse_args() {
                     log_error "--webhook-url requires a non-empty URL argument."
                     exit 1
                 fi
+                log_warn "--webhook-url is deprecated and exposes secrets in process listings (ps); pass DISCORD_WEBHOOK_URL via environment or pre-create $ENV_FILE instead."
                 shift
                 ;;
             --skip-upgrades)
@@ -140,13 +192,31 @@ ensure_root() {
         return 0
     fi
 
-    if command -v sudo >/dev/null 2>&1 && [[ -f "$0" ]]; then
+    if command -v sudo >/dev/null 2>&1 \
+        && [[ -n "${BASH_SOURCE[0]:-}" && "${BASH_SOURCE[0]}" != "bash" && -f "${BASH_SOURCE[0]}" ]]; then
         log_info "Elevating privileges with sudo..."
-        exec sudo -E bash "$0" "$@"
+        if [[ -n "${DISCORD_WEBHOOK_URL:-}" || -n "${DISCORD_WEBHOOK:-}" || -n "${WEBHOOK_URL:-}" ]]; then
+            exec sudo --preserve-env=DISCORD_WEBHOOK_URL,DISCORD_WEBHOOK,WEBHOOK_URL bash "${BASH_SOURCE[0]}" "$@"
+        fi
+        exec sudo bash "${BASH_SOURCE[0]}" "$@"
     fi
 
     log_error "This script must be run as root (e.g. via sudo)."
     exit 1
+}
+
+resolve_env_group() {
+    if getent group mail >/dev/null 2>&1; then
+        ENV_GROUP="mail"
+    elif getent group mail2hook >/dev/null 2>&1; then
+        ENV_GROUP="mail2hook"
+    elif [[ "$FLAG_UNINSTALL" -eq 0 ]] && command -v groupadd >/dev/null 2>&1; then
+        groupadd --system mail2hook
+        ENV_GROUP="mail2hook"
+        record_change "Created system group 'mail2hook' for $ENV_FILE access"
+    else
+        ENV_GROUP="root"
+    fi
 }
 
 detect_os() {
@@ -184,10 +254,6 @@ detect_os() {
             ;;
     esac
 
-    if ! getent group "$ENV_GROUP" >/dev/null 2>&1; then
-        ENV_GROUP="root"
-    fi
-
     log_info "Detected supported OS: ${OS_PRETTY} (${OS_ID} ${OS_VERSION_ID}, codename: ${OS_CODENAME})"
 }
 
@@ -195,16 +261,39 @@ is_systemd_running() {
     [[ -d /run/systemd/system ]] && command -v systemctl >/dev/null 2>&1
 }
 
+backup_file_to_dir() {
+    local target="$1"
+    local backup_dir="${2:-$BACKUP_DIR}"
+    if [[ ! -f "$target" ]]; then
+        return 0
+    fi
+
+    install -d -m 0750 -o root -g root "$backup_dir" 2>/dev/null || mkdir -p "$backup_dir"
+    local safe_name ts backup_path
+    safe_name="${target#/}"
+    safe_name="${safe_name//\//_}"
+    ts="$(date +%Y%m%d%H%M%S)"
+    backup_path="${backup_dir}/${safe_name}.${ts}.bak"
+    if [[ -e "$backup_path" ]]; then
+        local suffix=1
+        while [[ -e "${backup_dir}/${safe_name}.${ts}.${suffix}.bak" ]]; do
+            suffix=$((suffix + 1))
+        done
+        backup_path="${backup_dir}/${safe_name}.${ts}.${suffix}.bak"
+    fi
+    cp -a "$target" "$backup_path"
+    BACKUPS_CREATED+=("$backup_path")
+    log_info "Backed up $target to $backup_path"
+}
+
 backup_if_unmanaged() {
     local target="$1"
     local marker="${2:-Managed by mail2hook install.sh}"
+    local backup_dir="${3:-$BACKUP_DIR}"
 
     if [[ -f "$target" ]]; then
-        if ! grep -q "$marker" "$target" 2>/dev/null; then
-            local backup
-            backup="${target}.bak.$(date +%Y%m%d%H%M%S)"
-            cp -a "$target" "$backup"
-            log_info "Backed up existing $target to $backup"
+        if ! grep -Fq "$marker" "$target" 2>/dev/null; then
+            backup_file_to_dir "$target" "$backup_dir"
         fi
     fi
 }
@@ -256,11 +345,17 @@ prompt_yes_no() {
     local reply=""
 
     if [[ "$FLAG_YES" -eq 1 ]]; then
-        [[ "$default_ans" =~ ^[Yy] ]] && return 0 || return 1
+        if [[ "$default_ans" =~ ^[Yy] ]]; then
+            return 0
+        fi
+        return 1
     fi
 
     if [[ ! -e /dev/tty ]] || ! (: </dev/tty) 2>/dev/null; then
-        [[ "$default_ans" =~ ^[Yy] ]] && return 0 || return 1
+        if [[ "$default_ans" =~ ^[Yy] ]]; then
+            return 0
+        fi
+        return 1
     fi
 
     local hint="[y/N]"
@@ -272,7 +367,10 @@ prompt_yes_no() {
         printf '%s %s: ' "$prompt_msg" "$hint" >/dev/tty
         if ! IFS= read -r reply </dev/tty; then
             printf '\n' >/dev/tty
-            [[ "$default_ans" =~ ^[Yy] ]] && return 0 || return 1
+            if [[ "$default_ans" =~ ^[Yy] ]]; then
+                return 0
+            fi
+            return 1
         fi
         reply="${reply#"${reply%%[![:space:]]*}"}"
         reply="${reply%"${reply##*[![:space:]]}"}"
@@ -332,13 +430,13 @@ resolve_webhook_url() {
 
     # 3. Interactive prompt via /dev/tty with hidden input
     if [[ "$FLAG_YES" -eq 1 ]]; then
-        log_error "Non-interactive mode (--yes) set, but no Discord webhook URL was provided via --webhook-url, DISCORD_WEBHOOK_URL, or $ENV_FILE."
+        log_error "Non-interactive mode (--yes) set, but no Discord webhook URL was provided via DISCORD_WEBHOOK_URL or $ENV_FILE."
         exit 1
     fi
 
     if [[ ! -e /dev/tty ]] || ! (: </dev/tty) 2>/dev/null; then
         log_error "No controlling terminal (/dev/tty) available to prompt for Discord webhook URL."
-        log_error "Pass --webhook-url <url> or set DISCORD_WEBHOOK_URL in the environment."
+        log_error "Set DISCORD_WEBHOOK_URL in the environment (e.g. sudo --preserve-env=DISCORD_WEBHOOK_URL ...) or pre-create $ENV_FILE."
         exit 1
     fi
 
@@ -484,7 +582,7 @@ migrate_legacy_service() {
         fi
     fi
 
-    if getent group "$LEGACY_SERVICE_GROUP" >/dev/null 2>&1; then
+    if [[ "$ENV_GROUP" != "$LEGACY_SERVICE_GROUP" ]] && getent group "$LEGACY_SERVICE_GROUP" >/dev/null 2>&1; then
         local group_members
         group_members="$(getent group "$LEGACY_SERVICE_GROUP" | cut -d: -f4)"
         if [[ -z "$group_members" ]] && ! id -u "$LEGACY_SERVICE_USER" >/dev/null 2>&1; then
@@ -505,13 +603,6 @@ detect_local_checkout() {
     if [[ -n "$script_dir" && -f "$script_dir/pyproject.toml" && -d "$script_dir/src/mail2hook" ]]; then
         if grep -q 'name = "mail2hook"' "$script_dir/pyproject.toml" 2>/dev/null; then
             printf '%s' "$script_dir"
-            return 0
-        fi
-    fi
-
-    if [[ -f "./pyproject.toml" && -d "./src/mail2hook" ]]; then
-        if grep -q 'name = "mail2hook"' "./pyproject.toml" 2>/dev/null; then
-            pwd
             return 0
         fi
     fi
@@ -537,6 +628,7 @@ resolve_github_tarball_url() {
 install_mail2hook_binary() {
     local work_dir
     work_dir="$(mktemp -d)"
+    register_cleanup_path "$work_dir"
 
     local src_root=""
     local local_checkout=""
@@ -549,14 +641,12 @@ install_mail2hook_binary() {
         log_info "Downloading mail2hook source from $tarball_url..."
         local tarball_path="$work_dir/mail2hook.tar.gz"
         if ! curl -fsSL --connect-timeout 10 --max-time 60 "$tarball_url" -o "$tarball_path"; then
-            rm -rf "$work_dir"
             log_error "Failed to download mail2hook source archive."
             exit 1
         fi
-        tar -xzf "$tarball_path" -C "$work_dir"
+        tar --no-same-owner --no-same-permissions -xzf "$tarball_path" -C "$work_dir"
         src_root="$(find "$work_dir" -maxdepth 2 -type d -name src | head -n 1 || true)"
         if [[ -z "$src_root" || ! -d "$src_root/mail2hook" ]]; then
-            rm -rf "$work_dir"
             log_error "Downloaded archive did not contain src/mail2hook."
             exit 1
         fi
@@ -566,10 +656,11 @@ install_mail2hook_binary() {
     mkdir -p "$stage_dir"
     cp -a "$src_root/mail2hook" "$stage_dir/"
     find "$stage_dir" -type d -name "__pycache__" -exec rm -rf {} + 2>/dev/null || true
+    find "$stage_dir" -type l -delete 2>/dev/null || true
 
     local tmp_bin="$work_dir/mail2hook"
     python3 -m zipapp "$stage_dir" \
-        -p "/usr/bin/env python3" \
+        -p "/usr/bin/python3 -sE" \
         -m "mail2hook.cli:main" \
         -o "$tmp_bin"
 
@@ -577,6 +668,7 @@ install_mail2hook_binary() {
     install -m 0755 -o root -g root "$tmp_bin" "$BIN_PATH"
     rm -rf "$work_dir"
 
+    record_change "Installed mail2hook executable at $BIN_PATH"
     log_info "Installed executable at $BIN_PATH"
 }
 
@@ -674,7 +766,514 @@ configure_sendmail_link() {
         log_info "Linked $SENDMAIL_PATH -> $BIN_PATH"
     fi
 
-    SENDMAIL_LINKED=1
+    if [[ "$(readlink -f "$SENDMAIL_PATH" 2>/dev/null || true)" == "$BIN_PATH" ]]; then
+        SENDMAIL_LINKED=1
+        record_change "Linked $SENDMAIL_PATH -> $BIN_PATH via update-alternatives"
+    else
+        log_warn "$SENDMAIL_PATH does not resolve to $BIN_PATH after alternative registration."
+    fi
+}
+
+lowercase() {
+    printf '%s' "$1" | tr '[:upper:]' '[:lower:]'
+}
+
+trim_ws() {
+    local val="$1"
+    val="${val#"${val%%[![:space:]]*}"}"
+    val="${val%"${val##*[![:space:]]}"}"
+    printf '%s' "$val"
+}
+
+is_postfix_installed() {
+    if dpkg-query -W -f='${Status}' postfix 2>/dev/null | grep -q "install ok installed"; then
+        return 0
+    fi
+    if command -v postconf >/dev/null 2>&1 \
+        && [[ -f "$POSTFIX_MAIN_CF" && -f "$POSTFIX_MASTER_CF" ]]; then
+        return 0
+    fi
+    return 1
+}
+
+detect_postfix_db_type() {
+    local default_type="" supported_types=""
+    default_type="$(postconf -h default_database_type 2>/dev/null | tr -d '[:space:]' || true)"
+    supported_types="$(postconf -m 2>/dev/null || true)"
+
+    if [[ -n "$default_type" ]]; then
+        if [[ -z "$supported_types" ]] \
+            || printf '%s\n' "$supported_types" | grep -Fxq "$default_type"; then
+            printf '%s' "$default_type"
+            return 0
+        fi
+    fi
+
+    local candidate
+    for candidate in hash lmdb cdb btree; do
+        if printf '%s\n' "$supported_types" | grep -Fxq "$candidate"; then
+            printf '%s' "$candidate"
+            return 0
+        fi
+    done
+
+    printf '%s' "hash"
+}
+
+emit_master_cf_block() {
+    local pipe_user="$1"
+    local env_group="$2"
+    local bin_path="$3"
+
+    printf '%s\n' "$POSTFIX_MASTER_BEGIN"
+    printf 'mail2hook unix  -       n       n       -       -       pipe\n'
+    printf "  flags=R user=%s:%s argv=%s -oi -f \${sender} -- \${recipient}\n" \
+        "$pipe_user" "$env_group" "$bin_path"
+    printf '%s\n' "$POSTFIX_MASTER_END"
+}
+
+update_master_cf_block() {
+    local master_cf_path="$1"
+    local pipe_user="$2"
+    local env_group="$3"
+    local bin_path="$4"
+    local backup_dir="${5:-}"
+
+    local has_begin=0 has_end=0
+    if [[ -f "$master_cf_path" ]]; then
+        grep -Fq "$POSTFIX_MASTER_BEGIN" "$master_cf_path" && has_begin=1 || true
+        grep -Fq "$POSTFIX_MASTER_END" "$master_cf_path" && has_end=1 || true
+    fi
+
+    if [[ "$has_begin" -ne "$has_end" ]]; then
+        log_warn "Found incomplete mail2hook marker block in $master_cf_path; skipping automatic edit."
+        return 1
+    fi
+
+    if [[ "$has_begin" -eq 0 && -f "$master_cf_path" ]]; then
+        if grep -Eq '^[[:space:]]*mail2hook[[:space:]]+unix([[:space:]]|$)' "$master_cf_path"; then
+            log_warn "Found unmanaged 'mail2hook' transport in $master_cf_path; leaving existing entry untouched."
+            return 1
+        fi
+    fi
+
+    local tmp_file
+    tmp_file="$(mktemp "${master_cf_path}.tmp.XXXXXX")"
+    register_cleanup_path "$tmp_file"
+
+    local in_block=0 replaced=0 last_line="" line_count=0 line
+    if [[ -f "$master_cf_path" ]]; then
+        while IFS= read -r line || [[ -n "$line" ]]; do
+            line_count=$((line_count + 1))
+            if [[ "$line" == "$POSTFIX_MASTER_BEGIN" ]]; then
+                emit_master_cf_block "$pipe_user" "$env_group" "$bin_path" >> "$tmp_file"
+                in_block=1
+                replaced=1
+                continue
+            fi
+            if [[ "$in_block" -eq 1 ]]; then
+                if [[ "$line" == "$POSTFIX_MASTER_END" ]]; then
+                    in_block=0
+                fi
+                continue
+            fi
+            printf '%s\n' "$line" >> "$tmp_file"
+            last_line="$line"
+        done < "$master_cf_path"
+    fi
+
+    if [[ "$replaced" -eq 0 ]]; then
+        if [[ "$line_count" -gt 0 && -n "$last_line" ]]; then
+            printf '\n' >> "$tmp_file"
+        fi
+        emit_master_cf_block "$pipe_user" "$env_group" "$bin_path" >> "$tmp_file"
+    fi
+
+    if [[ -f "$master_cf_path" ]] && cmp -s "$master_cf_path" "$tmp_file"; then
+        rm -f "$tmp_file"
+        return 0
+    fi
+
+    if [[ -n "$backup_dir" && -f "$master_cf_path" ]]; then
+        backup_file_to_dir "$master_cf_path" "$backup_dir"
+    fi
+    chmod 0644 "$tmp_file"
+    mv -f "$tmp_file" "$master_cf_path"
+    record_change "Configured mail2hook pipe transport in $master_cf_path"
+    return 0
+}
+
+remove_master_cf_block() {
+    local master_cf_path="$1"
+    local backup_dir="${2:-}"
+
+    if [[ ! -f "$master_cf_path" ]]; then
+        return 0
+    fi
+    if ! grep -Fq "$POSTFIX_MASTER_BEGIN" "$master_cf_path" \
+        || ! grep -Fq "$POSTFIX_MASTER_END" "$master_cf_path"; then
+        return 0
+    fi
+
+    local tmp_file
+    tmp_file="$(mktemp "${master_cf_path}.tmp.XXXXXX")"
+    register_cleanup_path "$tmp_file"
+
+    local in_block=0 had_blank_before=0 removed_at_eof=1 line
+    local -a kept_lines=()
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        if [[ "$line" == "$POSTFIX_MASTER_BEGIN" ]]; then
+            in_block=1
+            if [[ "${#kept_lines[@]}" -gt 0 ]]; then
+                local last_idx=$((${#kept_lines[@]} - 1))
+                if [[ -z "${kept_lines[$last_idx]}" ]]; then
+                    had_blank_before=1
+                fi
+            fi
+            continue
+        fi
+        if [[ "$in_block" -eq 1 ]]; then
+            if [[ "$line" == "$POSTFIX_MASTER_END" ]]; then
+                in_block=0
+            fi
+            continue
+        fi
+        if [[ "$had_blank_before" -eq 1 ]]; then
+            removed_at_eof=0
+            if [[ -z "$line" ]]; then
+                unset "kept_lines[$(( ${#kept_lines[@]} - 1 ))]"
+            fi
+            had_blank_before=0
+        fi
+        kept_lines+=("$line")
+    done < "$master_cf_path"
+
+    if [[ "$had_blank_before" -eq 1 && "$removed_at_eof" -eq 1 && "${#kept_lines[@]}" -gt 0 ]]; then
+        if [[ -z "${kept_lines[$(( ${#kept_lines[@]} - 1 ))]}" ]]; then
+            unset "kept_lines[$(( ${#kept_lines[@]} - 1 ))]"
+        fi
+    fi
+
+    local out_line
+    for out_line in "${kept_lines[@]+"${kept_lines[@]}"}"; do
+        printf '%s\n' "$out_line" >> "$tmp_file"
+    done
+
+    if cmp -s "$master_cf_path" "$tmp_file"; then
+        rm -f "$tmp_file"
+        return 0
+    fi
+
+    if [[ -n "$backup_dir" ]]; then
+        backup_file_to_dir "$master_cf_path" "$backup_dir"
+    fi
+    chmod 0644 "$tmp_file"
+    mv -f "$tmp_file" "$master_cf_path"
+    record_change "Removed mail2hook pipe transport from $master_cf_path"
+    return 0
+}
+
+prepend_transport_map_value() {
+    local existing="${1:-}"
+    local map_spec="$2"
+    local transport_file="$3"
+    local normalized token
+    local -a out=("$map_spec")
+
+    normalized="${existing//,/ }"
+    for token in $normalized; do
+        [[ -z "$token" ]] && continue
+        if [[ "$token" == "$transport_file" || "$token" == *":${transport_file}" ]]; then
+            continue
+        fi
+        out+=("$token")
+    done
+
+    local joined="" i
+    for i in "${!out[@]}"; do
+        if [[ "$i" -eq 0 ]]; then
+            joined="${out[$i]}"
+        else
+            joined="${joined}, ${out[$i]}"
+        fi
+    done
+    printf '%s' "$joined"
+}
+
+strip_transport_map_value() {
+    local existing="${1:-}"
+    local transport_file="$2"
+    local normalized token
+    local -a out=()
+
+    normalized="${existing//,/ }"
+    for token in $normalized; do
+        [[ -z "$token" ]] && continue
+        if [[ "$token" == "$transport_file" || "$token" == *":${transport_file}" ]]; then
+            continue
+        fi
+        out+=("$token")
+    done
+
+    local joined="" i
+    for i in "${!out[@]}"; do
+        if [[ "$i" -eq 0 ]]; then
+            joined="${out[$i]}"
+        else
+            joined="${joined}, ${out[$i]}"
+        fi
+    done
+    printf '%s' "$joined"
+}
+
+save_previous_apt_mail_target() {
+    local current_target="${1:-}"
+    local orig_file="${2:-$APT_MAIL_ORIG_BACKUP}"
+    local backup_dir="${3:-$BACKUP_DIR}"
+    local trimmed lower_cur
+
+    trimmed="$(trim_ws "$current_target")"
+    lower_cur="$(lowercase "$trimmed")"
+
+    if [[ -f "$orig_file" ]]; then
+        cat "$orig_file" 2>/dev/null || true
+        return 0
+    fi
+
+    if [[ "$lower_cur" == "$(lowercase "$POSTFIX_RECIPIENT")" ]]; then
+        printf '%s' ""
+        return 0
+    fi
+
+    install -d -m 0750 -o root -g root "$backup_dir" 2>/dev/null || mkdir -p "$backup_dir"
+    printf '%s' "$trimmed" > "$orig_file"
+    chmod 0640 "$orig_file"
+    printf '%s' "$trimmed"
+}
+
+restore_apt_mail_target() {
+    local apt_file="$1"
+    local orig_file="${2:-$APT_MAIL_ORIG_BACKUP}"
+    local backup_dir="${3:-$BACKUP_DIR}"
+
+    if [[ ! -f "$apt_file" ]] || ! grep -Fq "$POSTFIX_RECIPIENT" "$apt_file" 2>/dev/null; then
+        return 0
+    fi
+
+    local has_orig=0 orig_val=""
+    if [[ -f "$orig_file" ]]; then
+        has_orig=1
+        orig_val="$(cat "$orig_file" 2>/dev/null || true)"
+        orig_val="$(trim_ws "$orig_val")"
+    fi
+
+    local tmp_file
+    tmp_file="$(mktemp "${apt_file}.tmp.XXXXXX")"
+    register_cleanup_path "$tmp_file"
+
+    local line
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        if [[ "$line" =~ ^[[:space:]]*Unattended-Upgrade::Mail[[:space:]]+\"(.*)\"[[:space:]]*\;[[:space:]]*$ ]]; then
+            if [[ -n "$orig_val" ]]; then
+                printf 'Unattended-Upgrade::Mail "%s";\n' "$orig_val" >> "$tmp_file"
+            else
+                printf '// Unattended-Upgrade::Mail ""; // Restored by mail2hook uninstall\n' >> "$tmp_file"
+            fi
+        else
+            printf '%s\n' "$line" >> "$tmp_file"
+        fi
+    done < "$apt_file"
+
+    if ! cmp -s "$apt_file" "$tmp_file"; then
+        if [[ -n "$backup_dir" ]]; then
+            backup_file_to_dir "$apt_file" "$backup_dir"
+        fi
+        chmod 0644 "$tmp_file"
+        mv -f "$tmp_file" "$apt_file"
+        if [[ -n "$orig_val" ]]; then
+            record_change "Restored Unattended-Upgrade::Mail to \"${orig_val}\" in $apt_file"
+        else
+            record_change "Restored Unattended-Upgrade::Mail to unset in $apt_file"
+        fi
+    else
+        rm -f "$tmp_file"
+    fi
+
+    if [[ "$has_orig" -eq 1 ]]; then
+        rm -f "$orig_file"
+    fi
+}
+
+ensure_env_filter_default() {
+    local env_path="$1"
+    local default_keywords="${2:-$DEFAULT_SUBJECT_FILTER}"
+
+    if [[ ! -f "$env_path" ]]; then
+        return 0
+    fi
+
+    if grep -Eq '^[[:space:]]*(export[[:space:]]+)?FILTER_SUBJECT_KEYWORDS[[:space:]]*=' "$env_path" 2>/dev/null; then
+        return 0
+    fi
+
+    local tmp_filter
+    tmp_filter="$(mktemp "${env_path}.tmp.XXXXXX")"
+    register_cleanup_path "$tmp_filter"
+
+    local line inserted=0
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        if [[ "$inserted" -eq 0 && "$line" =~ ^[[:space:]]*#[[:space:]]*FILTER_SUBJECT_KEYWORDS[[:space:]]*= ]]; then
+            printf 'FILTER_SUBJECT_KEYWORDS=%s\n' "$default_keywords" >> "$tmp_filter"
+            inserted=1
+        else
+            printf '%s\n' "$line" >> "$tmp_filter"
+        fi
+    done < "$env_path"
+
+    if [[ "$inserted" -eq 0 ]]; then
+        printf '\n# Restrict Discord alerts to unattended-upgrades mail by default\n' >> "$tmp_filter"
+        printf 'FILTER_SUBJECT_KEYWORDS=%s\n' "$default_keywords" >> "$tmp_filter"
+    fi
+
+    mv -f "$tmp_filter" "$env_path"
+}
+
+read_env_var() {
+    local env_path="$1"
+    local var_name="$2"
+
+    if [[ ! -f "$env_path" ]]; then
+        return 0
+    fi
+
+    local line val found_val=""
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        if [[ "$line" =~ ^[[:space:]]*(export[[:space:]]+)?${var_name}[[:space:]]*=(.*)$ ]]; then
+            val="$(trim_ws "${BASH_REMATCH[2]}")"
+            if [[ "$val" =~ ^\"(.*)\"[[:space:]]*(#.*)?$ ]]; then
+                val="${BASH_REMATCH[1]}"
+            elif [[ "$val" =~ ^\'(.*)\'[[:space:]]*(#.*)?$ ]]; then
+                val="${BASH_REMATCH[1]}"
+            else
+                val="${val%% #*}"
+                val="$(trim_ws "$val")"
+            fi
+            found_val="$val"
+        fi
+    done < "$env_path"
+
+    printf '%s' "$found_val"
+}
+
+reload_postfix() {
+    if is_systemd_running && systemctl is-active --quiet postfix 2>/dev/null; then
+        systemctl reload postfix
+    elif command -v postfix >/dev/null 2>&1; then
+        postfix reload 2>/dev/null || true
+    fi
+}
+
+configure_postfix_pipe() {
+    if ! id -u "$POSTFIX_PIPE_USER" >/dev/null 2>&1; then
+        log_error "Postfix pipe user '$POSTFIX_PIPE_USER' does not exist on this system."
+        exit 1
+    fi
+    if [[ "$ENV_GROUP" == "root" ]]; then
+        log_error "No dedicated group ('mail' or 'mail2hook') available for $ENV_FILE; user '$POSTFIX_PIPE_USER' would not be able to read it."
+        exit 1
+    fi
+    if ! command -v postconf >/dev/null 2>&1 || ! command -v postmap >/dev/null 2>&1; then
+        log_error "Postfix is installed, but postconf/postmap commands are unavailable."
+        exit 1
+    fi
+    if [[ ! -f "$POSTFIX_MAIN_CF" || ! -f "$POSTFIX_MASTER_CF" ]]; then
+        log_error "Postfix configuration files ($POSTFIX_MAIN_CF / $POSTFIX_MASTER_CF) not found."
+        exit 1
+    fi
+
+    local db_type map_spec mydomain
+    db_type="$(detect_postfix_db_type)"
+    map_spec="${db_type}:${POSTFIX_TRANSPORT_FILE}"
+    mydomain="$(postconf -h mydomain 2>/dev/null | tr -d '[:space:]' || true)"
+
+    local tmp_transport
+    tmp_transport="$(mktemp "${POSTFIX_TRANSPORT_FILE}.tmp.XXXXXX")"
+    register_cleanup_path "$tmp_transport"
+    {
+        printf '# Managed by mail2hook install.sh\n'
+        printf '%s %s:\n' "$POSTFIX_RECIPIENT" "$POSTFIX_TRANSPORT_NAME"
+        printf 'mail2hook@localhost.localdomain %s:\n' "$POSTFIX_TRANSPORT_NAME"
+        if [[ -n "$mydomain" && "$mydomain" != "localhost" && "$mydomain" != "localdomain" ]]; then
+            printf 'mail2hook@localhost.%s %s:\n' "$mydomain" "$POSTFIX_TRANSPORT_NAME"
+        fi
+    } > "$tmp_transport"
+
+    local need_postmap=0
+    if [[ ! -f "$POSTFIX_TRANSPORT_FILE" ]] || ! cmp -s "$POSTFIX_TRANSPORT_FILE" "$tmp_transport"; then
+        backup_if_unmanaged "$POSTFIX_TRANSPORT_FILE" "Managed by mail2hook install.sh"
+        chmod 0644 "$tmp_transport"
+        mv -f "$tmp_transport" "$POSTFIX_TRANSPORT_FILE"
+        need_postmap=1
+        record_change "Wrote Postfix transport map at $POSTFIX_TRANSPORT_FILE"
+    else
+        rm -f "$tmp_transport"
+    fi
+
+    if [[ "$need_postmap" -eq 1 ]] || [[ ! -e "${POSTFIX_TRANSPORT_FILE}.db" && ! -e "${POSTFIX_TRANSPORT_FILE}.lmdb" && ! -e "${POSTFIX_TRANSPORT_FILE}.cdb" ]]; then
+        postmap "$map_spec"
+        record_change "Compiled Postfix transport table (${map_spec})"
+    fi
+
+    if ! update_master_cf_block "$POSTFIX_MASTER_CF" "$POSTFIX_PIPE_USER" "$ENV_GROUP" "$BIN_PATH" "$BACKUP_DIR"; then
+        log_error "Could not safely update $POSTFIX_MASTER_CF. Resolve the existing 'mail2hook' entry and re-run."
+        exit 1
+    fi
+
+    local cur_maps cur_limit new_maps limit_param
+    cur_maps="$(postconf -h transport_maps 2>/dev/null || true)"
+    limit_param="${POSTFIX_TRANSPORT_NAME}_destination_recipient_limit"
+    cur_limit="$(postconf -h "$limit_param" 2>/dev/null | tr -d '[:space:]' || true)"
+    new_maps="$(prepend_transport_map_value "$cur_maps" "$map_spec" "$POSTFIX_TRANSPORT_FILE")"
+
+    if [[ "$cur_maps" != "$new_maps" || "$cur_limit" != "1" ]]; then
+        backup_file_to_dir "$POSTFIX_MAIN_CF" "$BACKUP_DIR"
+        if [[ "$cur_maps" != "$new_maps" ]]; then
+            postconf -e "transport_maps = ${new_maps}"
+            record_change "Added ${map_spec} to transport_maps in $POSTFIX_MAIN_CF"
+        fi
+        if [[ "$cur_limit" != "1" ]]; then
+            postconf -e "${limit_param} = 1"
+            record_change "Set ${limit_param} = 1 in $POSTFIX_MAIN_CF"
+        fi
+    fi
+
+    if ! postfix check; then
+        log_error "postfix check failed after updating Postfix configuration. Backups are saved in $BACKUP_DIR."
+        exit 1
+    fi
+
+    reload_postfix
+    log_info "Configured Postfix pipe transport ($POSTFIX_RECIPIENT -> $BIN_PATH as ${POSTFIX_PIPE_USER}:${ENV_GROUP})"
+}
+
+configure_mail_integration() {
+    SENDMAIL_LINKED=0
+
+    if is_postfix_installed; then
+        INSTALL_MODE="postfix-pipe"
+        DETECTED_MTAS="postfix"
+        log_info "Detected Postfix; leaving $SENDMAIL_PATH untouched and configuring pipe transport alongside it."
+        configure_postfix_pipe
+        return 0
+    fi
+
+    configure_sendmail_link
+    if [[ "$SENDMAIL_LINKED" -eq 1 ]]; then
+        INSTALL_MODE="sendmail-shim"
+    else
+        INSTALL_MODE="manual-mta"
+        DETECTED_MTAS="$(detect_conflicting_mta || true)"
+    fi
 }
 
 write_env_file() {
@@ -682,8 +1281,9 @@ write_env_file() {
 
     local tmp_env
     tmp_env="$(mktemp "${CONFIG_DIR}/.env.tmp.XXXXXX")"
-    chown "root:${ENV_GROUP}" "$tmp_env"
-    chmod 0640 "$tmp_env"
+    register_cleanup_path "$tmp_env"
+    chown root:root "$tmp_env"
+    chmod 0600 "$tmp_env"
 
     if [[ -f "$ENV_FILE" ]]; then
         local updated=0
@@ -707,6 +1307,8 @@ write_env_file() {
         if [[ "$updated" -eq 0 ]]; then
             printf '\nDISCORD_WEBHOOK_URL=%s\n' "$RESOLVED_WEBHOOK_URL" >> "$tmp_env"
         fi
+
+        ensure_env_filter_default "$tmp_env" "$DEFAULT_SUBJECT_FILTER"
     else
         cat > "$tmp_env" <<EOF
 # /etc/mail2hook/env - Configuration for mail2hook
@@ -720,11 +1322,13 @@ DISCORD_WEBHOOK_URL=${RESOLVED_WEBHOOK_URL}
 # Optional: Friendly server name display in Discord (defaults to system hostname)
 # SERVER_NAME=
 
-# Optional: Comma-separated sender addresses or domains to match. If unset, all senders match.
+# Optional: Comma-separated sender addresses, domains, or usernames to match. If unset, all senders match.
 # FILTER_SENDERS=
 
-# Optional: Comma-separated subject keywords to match (case-insensitive). If unset, all subjects match.
-# FILTER_SUBJECT_KEYWORDS=
+# Comma-separated subject keywords to match (case-insensitive).
+# Defaults to unattended-upgrades so cron/other local mail is dropped silently (exit 0).
+# Set empty (FILTER_SUBJECT_KEYWORDS=) to forward all mail subjects.
+FILTER_SUBJECT_KEYWORDS=${DEFAULT_SUBJECT_FILTER}
 
 # Optional: Maximum body characters to include in the Discord embed excerpt (default: 1500)
 # MAX_BODY_CHARS=1500
@@ -737,6 +1341,8 @@ EOF
     chown "root:${ENV_GROUP}" "$tmp_env"
     chmod 0640 "$tmp_env"
     mv -f "$tmp_env" "$ENV_FILE"
+    ACTIVE_SUBJECT_FILTER="$(read_env_var "$ENV_FILE" "FILTER_SUBJECT_KEYWORDS")"
+    record_change "Configured $ENV_FILE (root:${ENV_GROUP}, mode 0640; FILTER_SUBJECT_KEYWORDS=${ACTIVE_SUBJECT_FILTER:-<all>})"
     log_info "Secured configuration file at $ENV_FILE (root:${ENV_GROUP}, mode 0640)"
 }
 
@@ -751,6 +1357,16 @@ ubuntu_esm_security_present() {
     return 1
 }
 
+read_apt_mail_target() {
+    local raw=""
+    if command -v apt-config >/dev/null 2>&1; then
+        raw="$(apt-config dump Unattended-Upgrade::Mail 2>/dev/null \
+            | sed -n 's/^Unattended-Upgrade::Mail[[:space:]]*"\(.*\)";[[:space:]]*$/\1/p' \
+            | head -n 1 || true)"
+    fi
+    printf '%s' "$raw"
+}
+
 configure_unattended_upgrades() {
     if [[ "$FLAG_SKIP_UPGRADES" -eq 1 ]]; then
         log_info "Skipping unattended-upgrades configuration (--skip-upgrades)."
@@ -758,6 +1374,15 @@ configure_unattended_upgrades() {
     fi
 
     log_info "Configuring conservative security-only unattended-upgrades..."
+
+    local existing_mail=""
+    existing_mail="$(read_apt_mail_target)"
+    if [[ "$INSTALL_MODE" == "postfix-pipe" ]]; then
+        PREVIOUS_UPGRADE_MAIL_TARGET="$(save_previous_apt_mail_target "$existing_mail" "$APT_MAIL_ORIG_BACKUP" "$BACKUP_DIR")"
+        UPGRADE_MAIL_TARGET="$POSTFIX_RECIPIENT"
+    else
+        UPGRADE_MAIL_TARGET="root"
+    fi
 
     if [[ -f "$APT_LEGACY_MAIL2HOOK" ]]; then
         backup_if_unmanaged "$APT_LEGACY_MAIL2HOOK" "Default unattended-upgrades configuration for mail2hook"
@@ -813,14 +1438,14 @@ EOF
 
 ${origins_block}
 
-// Deliver upgrade notifications to mail2hook via /usr/sbin/sendmail.
-// unattended-upgrades invokes /usr/sbin/sendmail directly (no mailx needed).
-Unattended-Upgrade::Mail "root";
+// Deliver upgrade notifications via /usr/sbin/sendmail (no mailx needed).
+Unattended-Upgrade::Mail "${UPGRADE_MAIL_TARGET}";
 
 // Notify only when packages are upgraded/kept-back/removed or an error occurs,
 // keeping Discord quiet on uneventful zero-change nightly runs.
 // Valid options: "on-change" (recommended), "always", "only-on-error".
 Unattended-Upgrade::MailReport "on-change";
+Unattended-Upgrade::MailOnlyOnError "false";
 Unattended-Upgrade::Sender "unattended-upgrades";
 
 // Never reboot automatically; mail2hook reports pending reboots in Discord
@@ -832,6 +1457,7 @@ Unattended-Upgrade::Remove-Unused-Dependencies "false";
 Unattended-Upgrade::Remove-Unused-Kernel-Packages "false";
 EOF
     chmod 0644 "$APT_LOCAL_UPGRADES"
+    record_change "Configured unattended-upgrades drop-ins ($APT_AUTO_UPGRADES, $APT_LOCAL_UPGRADES; Mail=\"${UPGRADE_MAIL_TARGET}\")"
     log_info "Wrote APT periodic and security-only drop-ins ($APT_AUTO_UPGRADES, $APT_LOCAL_UPGRADES)"
 
     install -d -m 0755 "$TIMER_DAILY_DIR" "$TIMER_UPGRADE_DIR"
@@ -859,6 +1485,7 @@ RandomizedDelaySec=60m
 Persistent=true
 EOF
     chmod 0644 "$TIMER_UPGRADE_CONF"
+    record_change "Configured APT systemd timer overrides ($TIMER_DAILY_CONF, $TIMER_UPGRADE_CONF)"
     log_info "Wrote systemd timer overrides ($TIMER_DAILY_CONF, $TIMER_UPGRADE_CONF)"
 
     if is_systemd_running; then
@@ -897,37 +1524,112 @@ verify_unattended_upgrades() {
     fi
 }
 
+wait_for_e2e_marker() {
+    local marker_file="$1"
+    local test_id="$2"
+    local timeout_secs="${3:-15}"
+    local poll_interval="${4:-0.5}"
+
+    local max_polls
+    max_polls="$(awk -v t="$timeout_secs" -v p="$poll_interval" 'BEGIN { n = int(t / p + 0.5); if (n < 1) n = 1; print n }')"
+
+    local i=0 line status
+    while [[ "$i" -lt "$max_polls" ]]; do
+        if [[ -f "$marker_file" ]]; then
+            line="$(tr -d '\r' < "$marker_file" 2>/dev/null | head -n 1 || true)"
+            if [[ -n "$line" && "$line" == *":${test_id}" ]]; then
+                status="${line%":${test_id}"}"
+                printf '%s' "$status"
+                case "$status" in
+                    ok) return 0 ;;
+                    filtered) return 2 ;;
+                    *) return 3 ;;
+                esac
+            fi
+        fi
+        i=$((i + 1))
+        if [[ "$i" -lt "$max_polls" ]]; then
+            sleep "$poll_interval"
+        fi
+    done
+
+    printf '%s' "timeout"
+    return 1
+}
+
 run_sendmail_e2e_test() {
     local host_name
     host_name="$(hostname 2>/dev/null || echo 'server')"
+    E2E_FAILED=0
+    E2E_FAILURE_REASON=""
 
-    if [[ "$SENDMAIL_LINKED" -eq 1 ]]; then
-        log_info "Sending end-to-end test message through $SENDMAIL_PATH..."
-        local rc=0
-        if printf 'Subject: mail2hook install test on %s\nFrom: root\n\nmail2hook sendmail shim verification succeeded.\n' "$host_name" \
-            | "$SENDMAIL_PATH" -t -oi root; then
-            E2E_STATUS="passed (via $SENDMAIL_PATH)"
-            log_info "End-to-end sendmail test succeeded."
+    if [[ "$INSTALL_MODE" == "postfix-pipe" || "$SENDMAIL_LINKED" -eq 1 ]]; then
+        local test_id recipient route_label
+        test_id="$(python3 -c 'import secrets; print(secrets.token_hex(16))')"
+        if [[ "$INSTALL_MODE" == "postfix-pipe" ]]; then
+            recipient="$POSTFIX_RECIPIENT"
+            route_label="Postfix pipe ($POSTFIX_RECIPIENT)"
         else
-            rc=$?
-            E2E_STATUS="failed (exit code ${rc})"
-            log_warn "End-to-end sendmail test failed with exit code ${rc}."
-            log_warn "Verify network access and the webhook URL in $ENV_FILE, then re-test with:"
-            log_warn "  echo \"Subject: test\" | sudo $SENDMAIL_PATH root"
+            recipient="root"
+            route_label="sendmail shim"
         fi
+
+        install -d -m 0770 -o root -g "$ENV_GROUP" "$E2E_MARKER_DIR"
+        register_cleanup_path "$E2E_MARKER_DIR"
+        install -m 0660 -o root -g "$ENV_GROUP" /dev/null "$E2E_MARKER_FILE"
+
+        log_info "Submitting real-path E2E test through $SENDMAIL_PATH ($route_label)..."
+        local send_rc=0
+        if printf 'To: %s\nFrom: root\nSubject: unattended-upgrades install test for %s\nX-Mail2Hook-Test-Id: %s\n\nmail2hook end-to-end delivery check via %s (%s).\n' \
+            "$recipient" "$host_name" "$test_id" "$SENDMAIL_PATH" "$route_label" \
+            | "$SENDMAIL_PATH" -oi -t; then
+            local marker_status="" marker_rc=0
+            marker_status="$(wait_for_e2e_marker "$E2E_MARKER_FILE" "$test_id" 15 0.5)" || marker_rc=$?
+
+            case "$marker_rc" in
+                0)
+                    E2E_FAILED=0
+                    E2E_STATUS="confirmed (delivered via $SENDMAIL_PATH -> $BIN_PATH -> Discord)"
+                    log_info "End-to-end test confirmed through $SENDMAIL_PATH ($route_label)."
+                    ;;
+                2)
+                    E2E_FAILED=1
+                    E2E_STATUS="FAILED (reached mail2hook via $SENDMAIL_PATH, but dropped by filter)"
+                    E2E_FAILURE_REASON="The test reached $BIN_PATH via $SENDMAIL_PATH, but was dropped by FILTER_SENDERS or FILTER_SUBJECT_KEYWORDS in $ENV_FILE."
+                    log_error "$E2E_FAILURE_REASON"
+                    ;;
+                3)
+                    local fail_code="${marker_status#failed:}"
+                    E2E_FAILED=1
+                    E2E_STATUS="FAILED (mail2hook exited ${fail_code} via $SENDMAIL_PATH)"
+                    E2E_FAILURE_REASON="The test reached $BIN_PATH via $SENDMAIL_PATH, but mail2hook exited with code ${fail_code}."
+                    log_error "$E2E_FAILURE_REASON"
+                    ;;
+                *)
+                    E2E_FAILED=1
+                    E2E_STATUS="FAILED (timed out waiting for mail2hook confirmation via $SENDMAIL_PATH)"
+                    E2E_FAILURE_REASON="Submitted test message via $SENDMAIL_PATH ($route_label), but mail2hook did not report delivery within 15s."
+                    log_error "$E2E_FAILURE_REASON"
+                    ;;
+            esac
+        else
+            send_rc=$?
+            E2E_FAILED=1
+            E2E_STATUS="FAILED ($SENDMAIL_PATH exited ${send_rc})"
+            E2E_FAILURE_REASON="$SENDMAIL_PATH exited with code ${send_rc} before queuing/delivering the test message."
+            log_error "$E2E_FAILURE_REASON"
+        fi
+
+        rm -rf "$E2E_MARKER_DIR"
     else
-        log_warn "Skipping $SENDMAIL_PATH end-to-end test because another MTA owns $SENDMAIL_PATH."
-        log_info "Testing $BIN_PATH directly instead..."
-        local rc=0
-        if printf 'Subject: mail2hook install test on %s\nFrom: root\n\nmail2hook direct invocation verification succeeded.\n' "$host_name" \
-            | "$BIN_PATH" -t -oi root; then
-            E2E_STATUS="passed (direct $BIN_PATH; $SENDMAIL_PATH unchanged)"
-            log_info "Direct $BIN_PATH test succeeded."
-        else
-            rc=$?
-            E2E_STATUS="failed (direct $BIN_PATH exit code ${rc})"
-            log_warn "Direct $BIN_PATH test failed with exit code ${rc}."
-        fi
+        E2E_FAILED=1
+        E2E_STATUS="FAILED — not linked ($SENDMAIL_PATH owned by ${DETECTED_MTAS:-existing MTA})"
+        E2E_FAILURE_REASON="$SENDMAIL_PATH is still owned by ${DETECTED_MTAS:-another MTA} and is NOT linked to mail2hook."
+        log_error "$E2E_FAILURE_REASON"
+        log_warn "Posting an unlinked-warning notice directly via $BIN_PATH (installer will still exit non-zero)..."
+        printf 'To: root\nFrom: root\nSubject: unattended-upgrades install notice for %s: NOT LINKED\n\nWARNING: mail2hook is NOT linked to %s (%s owns it).\nReal unattended-upgrades mail will NOT reach Discord until you configure your MTA or purge it and re-run install.sh.\n' \
+            "$host_name" "$SENDMAIL_PATH" "${DETECTED_MTAS:-another MTA}" \
+            | "$BIN_PATH" -oi -t || true
     fi
 }
 
@@ -957,7 +1659,9 @@ print_summary() {
     local tz_info
     tz_info="$(detect_timezone)"
     local sendmail_summary="not linked (existing MTA preserved)"
-    if [[ "$SENDMAIL_LINKED" -eq 1 ]]; then
+    if [[ "$INSTALL_MODE" == "postfix-pipe" ]]; then
+        sendmail_summary="$SENDMAIL_PATH untouched (Postfix preserved)"
+    elif [[ "$SENDMAIL_LINKED" -eq 1 ]]; then
         sendmail_summary="$SENDMAIL_PATH -> $BIN_PATH"
     fi
 
@@ -965,22 +1669,79 @@ print_summary() {
     printf 'mail2hook Installation Summary\n'
     printf '============================================================\n'
     printf '  OS Detected      : %s (%s)\n' "$OS_PRETTY" "$OS_CODENAME"
+    printf '  Install Mode     : %s\n' "${INSTALL_MODE:-unknown}"
     printf '  Server Timezone  : %s\n' "$tz_info"
     printf '  Executable       : %s\n' "$BIN_PATH"
-    printf '  Sendmail Link    : %s\n' "$sendmail_summary"
+    printf '  Sendmail Path    : %s\n' "$sendmail_summary"
+    if [[ "$INSTALL_MODE" == "postfix-pipe" ]]; then
+        printf '  Postfix Route    : %s -> %s pipe (user=%s:%s)\n' \
+            "$POSTFIX_RECIPIENT" "$POSTFIX_TRANSPORT_NAME" "$POSTFIX_PIPE_USER" "$ENV_GROUP"
+    fi
     printf '  Config File      : %s (root:%s, 0640)\n' "$ENV_FILE" "$ENV_GROUP"
+    printf '  Subject Filter   : %s\n' "${ACTIVE_SUBJECT_FILTER:-<all subjects>}"
     printf '  End-to-End Test  : %s\n' "$E2E_STATUS"
     if [[ "$FLAG_SKIP_UPGRADES" -eq 0 ]]; then
         printf '  Auto-Upgrades    : Security updates only (Automatic-Reboot: false)\n'
+        if [[ "$INSTALL_MODE" == "postfix-pipe" ]]; then
+            printf '  Upgrade Mail To  : %s (replaced previous value: %s)\n' \
+                "$UPGRADE_MAIL_TARGET" "${PREVIOUS_UPGRADE_MAIL_TARGET:-<unset>}"
+            printf '  Root Mail Policy : Other root/admin mail untouched (only %s enters pipe)\n' \
+                "$POSTFIX_RECIPIENT"
+        else
+            printf '  Upgrade Mail To  : %s\n' "$UPGRADE_MAIL_TARGET"
+        fi
         printf '  Download Window  : 01:00 - 02:00 local time (%s)\n' "$tz_info"
         printf '  Upgrade Window   : 03:00 - 04:00 local time (%s)\n' "$tz_info"
     else
         printf '  Auto-Upgrades    : Skipped (--skip-upgrades)\n'
     fi
+    if [[ "${#CHANGES_MADE[@]}" -gt 0 ]]; then
+        printf '\nChanges Applied:\n'
+        local chg
+        for chg in "${CHANGES_MADE[@]}"; do
+            printf '  - %s\n' "$chg"
+        done
+    fi
+    if [[ "${#BACKUPS_CREATED[@]}" -gt 0 ]]; then
+        printf '\nBackups Saved (%s):\n' "$BACKUP_DIR"
+        local bak
+        for bak in "${BACKUPS_CREATED[@]}"; do
+            printf '  - %s\n' "$bak"
+        done
+    fi
+    if [[ "$E2E_FAILED" -ne 0 ]]; then
+        printf '\n[ACTION REQUIRED] End-to-end delivery could NOT be confirmed!\n'
+        printf '  Reason: %s\n' "${E2E_FAILURE_REASON:-Unknown delivery failure}"
+        if [[ "$INSTALL_MODE" == "manual-mta" ]]; then
+            printf '  Remediation:\n'
+            printf '    1. Remove the conflicting MTA (%s) and re-run install.sh, OR\n' \
+                "${DETECTED_MTAS:-unknown}"
+            printf "    2. Configure your MTA to pipe %s to %s -oi -f \${sender} -- \${recipient}\n" \
+                "$POSTFIX_RECIPIENT" "$BIN_PATH"
+        elif [[ "$INSTALL_MODE" == "postfix-pipe" ]]; then
+            printf '  Remediation checks:\n'
+            printf '    sudo postqueue -p\n'
+            printf '    sudo journalctl -u postfix -n 50 --no-pager\n'
+            printf '    sudo postmap -q %s %s\n' "$POSTFIX_RECIPIENT" "$POSTFIX_TRANSPORT_FILE"
+            printf '    ls -ld %s %s\n' "$CONFIG_DIR" "$ENV_FILE"
+            printf '    printf "Subject: unattended-upgrades test\\n\\nHi\\n" | sudo -u %s %s --dry-run\n' \
+                "$POSTFIX_PIPE_USER" "$BIN_PATH"
+        else
+            printf '  Remediation checks:\n'
+            printf '    readlink -f %s\n' "$SENDMAIL_PATH"
+            printf '    printf "To: root\\nFrom: root\\nSubject: unattended-upgrades test\\n\\nHi\\n" | sudo %s -oi -t\n' \
+                "$SENDMAIL_PATH"
+        fi
+    fi
     printf '\nUseful Commands:\n'
+    printf '  Diagnostics      : sudo mail2hook --doctor\n'
     printf '  Upgrade logs     : sudo tail -n 50 /var/log/unattended-upgrades/unattended-upgrades.log\n'
-    printf '  Test sendmail    : echo "Subject: test" | sudo sendmail root\n'
-    printf '  Test dry-run     : printf "Subject: Test\\nFrom: root\\n\\nHello\\n" | sudo mail2hook --dry-run\n'
+    if [[ "$INSTALL_MODE" == "postfix-pipe" ]]; then
+        printf '  Test Postfix     : printf "To: %s\\nFrom: root\\nSubject: unattended-upgrades test\\n\\nHello\\n" | sudo sendmail -oi -t\n' "$POSTFIX_RECIPIENT"
+    else
+        printf '  Test sendmail    : printf "To: root\\nFrom: root\\nSubject: unattended-upgrades test\\n\\nHello\\n" | sudo sendmail -oi -t\n'
+    fi
+    printf '  Test dry-run     : printf "Subject: unattended-upgrades test\\nFrom: root\\n\\nHello\\n" | sudo mail2hook --dry-run\n'
     printf '============================================================\n'
 
     if [[ -f /var/run/reboot-required || -f /run/reboot-required ]]; then
@@ -989,14 +1750,70 @@ print_summary() {
     fi
 }
 
+remove_postfix_pipe() {
+    local postfix_touched=0
+
+    if [[ -f "$POSTFIX_MASTER_CF" ]] && grep -Fq "$POSTFIX_MASTER_BEGIN" "$POSTFIX_MASTER_CF" 2>/dev/null; then
+        remove_master_cf_block "$POSTFIX_MASTER_CF" "$BACKUP_DIR"
+        postfix_touched=1
+    fi
+
+    if command -v postconf >/dev/null 2>&1 && [[ -f "$POSTFIX_MAIN_CF" ]]; then
+        local cur_maps stripped_maps limit_param cur_limit
+        cur_maps="$(postconf -h transport_maps 2>/dev/null || true)"
+        stripped_maps="$(strip_transport_map_value "$cur_maps" "$POSTFIX_TRANSPORT_FILE")"
+        limit_param="${POSTFIX_TRANSPORT_NAME}_destination_recipient_limit"
+        cur_limit="$(postconf -h "$limit_param" 2>/dev/null | tr -d '[:space:]' || true)"
+
+        if [[ "$cur_maps" != "$stripped_maps" || -n "$cur_limit" ]]; then
+            backup_file_to_dir "$POSTFIX_MAIN_CF" "$BACKUP_DIR"
+            if [[ "$cur_maps" != "$stripped_maps" ]]; then
+                if [[ -n "$stripped_maps" ]]; then
+                    postconf -e "transport_maps = ${stripped_maps}"
+                else
+                    postconf -X transport_maps
+                fi
+                record_change "Removed $POSTFIX_TRANSPORT_FILE from transport_maps in $POSTFIX_MAIN_CF"
+            fi
+            if [[ -n "$cur_limit" ]]; then
+                postconf -X "$limit_param"
+                record_change "Removed $limit_param from $POSTFIX_MAIN_CF"
+            fi
+            postfix_touched=1
+        fi
+    fi
+
+    local ext removed_transport=0
+    for ext in "" ".db" ".lmdb" ".cdb" ".pag" ".dir"; do
+        if [[ -e "${POSTFIX_TRANSPORT_FILE}${ext}" ]]; then
+            rm -f "${POSTFIX_TRANSPORT_FILE}${ext}"
+            removed_transport=1
+        fi
+    done
+    if [[ "$removed_transport" -eq 1 ]]; then
+        record_change "Removed Postfix transport files ${POSTFIX_TRANSPORT_FILE}*"
+        postfix_touched=1
+    fi
+
+    if [[ "$postfix_touched" -eq 1 ]] && command -v postfix >/dev/null 2>&1; then
+        if postfix check 2>/dev/null; then
+            reload_postfix
+        else
+            log_warn "postfix check reported an error during uninstall; check $BACKUP_DIR."
+        fi
+    fi
+}
+
 run_uninstall() {
     log_info "Uninstalling mail2hook..."
 
     migrate_legacy_service
+    remove_postfix_pipe
 
     if command -v update-alternatives >/dev/null 2>&1; then
         if update-alternatives --query mta 2>/dev/null | grep -Fq "$BIN_PATH"; then
             update-alternatives --remove mta "$BIN_PATH"
+            record_change "Removed mail2hook from update-alternatives (mta)"
             log_info "Removed mail2hook from update-alternatives (mta)"
         fi
     fi
@@ -1007,6 +1824,7 @@ run_uninstall() {
             target="$(readlink "$link" || true)"
             if [[ "$target" == "$BIN_PATH" ]]; then
                 rm -f "$link"
+                record_change "Removed symlink $link"
                 log_info "Removed symlink $link"
             fi
         fi
@@ -1014,12 +1832,14 @@ run_uninstall() {
 
     if [[ -e "$BIN_PATH" || -L "$BIN_PATH" ]]; then
         rm -f "$BIN_PATH"
+        record_change "Removed executable $BIN_PATH"
         log_info "Removed executable $BIN_PATH"
     fi
 
     if [[ -d "$CONFIG_DIR" || -f "$ENV_FILE" ]]; then
         if prompt_yes_no "Delete configuration and secret webhook file in $CONFIG_DIR?" "n"; then
             rm -rf "$CONFIG_DIR"
+            record_change "Removed configuration directory $CONFIG_DIR"
             log_info "Removed configuration directory $CONFIG_DIR"
         else
             log_info "Kept configuration directory $CONFIG_DIR"
@@ -1028,16 +1848,33 @@ run_uninstall() {
 
     if [[ "$FLAG_PURGE_UPGRADES" -eq 1 ]]; then
         log_info "Purging unattended-upgrades drop-ins and timer overrides (--purge-upgrades)..."
-        rm -f "$APT_LOCAL_UPGRADES" "$APT_AUTO_UPGRADES" "$APT_LEGACY_MAIL2HOOK"
+        rm -f "$APT_LOCAL_UPGRADES" "$APT_AUTO_UPGRADES" "$APT_LEGACY_MAIL2HOOK" "$APT_MAIL_ORIG_BACKUP"
         rm -f "$TIMER_DAILY_CONF" "$TIMER_UPGRADE_CONF"
         rmdir --ignore-fail-on-non-empty "$TIMER_DAILY_DIR" "$TIMER_UPGRADE_DIR" 2>/dev/null || true
         if is_systemd_running; then
             systemctl daemon-reload
             systemctl restart apt-daily.timer apt-daily-upgrade.timer 2>/dev/null || true
         fi
+        record_change "Purged unattended-upgrades drop-ins and timer overrides"
         log_info "Removed unattended-upgrades local drop-ins and timer overrides."
     else
+        restore_apt_mail_target "$APT_LOCAL_UPGRADES" "$APT_MAIL_ORIG_BACKUP" "$BACKUP_DIR"
         log_info "Left unattended-upgrades configuration in place (pass --purge-upgrades to remove)."
+    fi
+
+    if [[ "${#CHANGES_MADE[@]}" -gt 0 ]]; then
+        printf '\nUninstall Changes:\n'
+        local chg
+        for chg in "${CHANGES_MADE[@]}"; do
+            printf '  - %s\n' "$chg"
+        done
+    fi
+    if [[ "${#BACKUPS_CREATED[@]}" -gt 0 ]]; then
+        printf '\nBackups Saved (%s):\n' "$BACKUP_DIR"
+        local bak
+        for bak in "${BACKUPS_CREATED[@]}"; do
+            printf '  - %s\n' "$bak"
+        done
     fi
 
     log_info "Uninstall complete."
@@ -1046,22 +1883,30 @@ run_uninstall() {
 main() {
     parse_args "$@"
     ensure_root "$@"
-    detect_os
+    resolve_env_group
 
     if [[ "$FLAG_UNINSTALL" -eq 1 ]]; then
         run_uninstall
         return 0
     fi
 
+    detect_os
     migrate_legacy_service
     resolve_webhook_url
     install_system_packages
     install_mail2hook_binary
-    configure_sendmail_link
     write_env_file
+    configure_mail_integration
     configure_unattended_upgrades
     run_sendmail_e2e_test
     print_summary
+
+    if [[ "$E2E_FAILED" -ne 0 ]]; then
+        log_error "Installation finished, but end-to-end verification failed. Resolve [ACTION REQUIRED] above."
+        exit 1
+    fi
 }
 
-main "$@"
+if [[ -z "${BASH_SOURCE[0]:-}" || "${BASH_SOURCE[0]}" == "${0}" ]]; then
+    main "$@"
+fi

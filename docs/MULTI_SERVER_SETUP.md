@@ -42,11 +42,12 @@ SERVER_NAME=prod-db01
 
 ## Existing MTAs
 
-If `postfix`, `exim4`, `msmtp-mta`, or `nullmailer` is already installed on a server:
-
-- `install.sh` detects it, warns, and leaves `/usr/sbin/sendmail` unchanged.
-- If you do not need local SMTP mail routing, remove the existing MTA (`sudo apt purge 'exim4*'` or `sudo apt purge postfix`) and re-run `install.sh` so `mail2hook` can register the `mta` alternative.
-- If you need to keep Postfix, configure a pipe transport in `/etc/postfix/master.cf` pointing to `/usr/local/bin/mail2hook`.
+- **Postfix (e.g. Proxmox VE / mail-enabled servers)**: `install.sh` **never replaces `/usr/sbin/sendmail`**. It preserves Postfix's own alerts (`proxmox-mail-forward`, `root` mail) and configures `mail2hook` alongside Postfix so **only `unattended-upgrades` reports** go to Discord:
+  - Pipe transport in `/etc/postfix/master.cf` (`flags=R user=nobody:mail argv=/usr/local/bin/mail2hook -oi -f ${sender} -- ${recipient}`)
+  - Dedicated transport map `/etc/postfix/mail2hook_transport` (`mail2hook@localhost mail2hook:`) plus `mail2hook_destination_recipient_limit = 1` in `/etc/postfix/main.cf` (other `root` mail is never diverted)
+  - Replaces `Unattended-Upgrade::Mail` with `"mail2hook@localhost"` (backing up the prior target and restoring it on `--uninstall`), with `FILTER_SUBJECT_KEYWORDS=unattended-upgrades` as defense in depth
+  - Backups of any edited files stored in `/var/backups/mail2hook/` (never in `/etc/apt/apt.conf.d/`)
+- **Other MTAs (`exim4`, `msmtp-mta`, `nullmailer`, `dma`)**: `install.sh` detects them, warns, and leaves `/usr/sbin/sendmail` unchanged. Either purge the existing MTA (`sudo apt purge 'exim4*'`) and re-run `install.sh`, or configure that MTA to pipe mail to `/usr/local/bin/mail2hook`.
 
 ---
 
@@ -59,26 +60,34 @@ If `postfix`, `exim4`, `msmtp-mta`, or `nullmailer` is already installed on a se
    *(On Debian 12/13, also include `lsb-release` for `unattended-upgrades`.)*
 
 2. **Install `/usr/local/bin/mail2hook`**:
-   Package `src/mail2hook` into `/usr/local/bin/mail2hook` (`0755`, `root:root`) or install with `pipx install --global .`.
-
-3. **Register `sendmail` via `update-alternatives`** (when no other MTA owns `/usr/sbin/sendmail`):
+   Package `src/mail2hook` as a standalone zipapp executable (`0755`, `root:root`):
    ```bash
-   sudo update-alternatives --install /usr/sbin/sendmail mta /usr/local/bin/mail2hook 10 \
-     --slave /usr/bin/mailq mta-mailq /usr/local/bin/mail2hook
+   python3 -m zipapp src -p "/usr/bin/python3 -sE" -m "mail2hook.cli:main" -o mail2hook.pyz
+   sudo install -m 0755 -o root -g root mail2hook.pyz /usr/local/bin/mail2hook
    ```
+
+3. **Connect `sendmail` or Postfix**:
+   - **No existing MTA**: Register `sendmail` via `update-alternatives`:
+     ```bash
+     sudo update-alternatives --install /usr/sbin/sendmail mta /usr/local/bin/mail2hook 10 \
+       --slave /usr/bin/mailq mta-mailq /usr/local/bin/mail2hook
+     ```
+   - **Existing Postfix**: Leave `/usr/sbin/sendmail` untouched and follow the Postfix pipe steps in [README.md](../README.md#interaction-with-an-existing-mta).
 
 4. **Create `/etc/mail2hook/env`**:
    ```bash
    sudo install -d -m 0750 -o root -g mail /etc/mail2hook
    sudo install -m 0640 -o root -g mail /dev/null /etc/mail2hook/env
    ```
-   Add `DISCORD_WEBHOOK_URL=...` (and optional `SERVER_NAME=...`) to `/etc/mail2hook/env`.
+   Add `DISCORD_WEBHOOK_URL=...`, `FILTER_SUBJECT_KEYWORDS=unattended-upgrades` (to forward only upgrade reports), and optional `SERVER_NAME=...` to `/etc/mail2hook/env`.
 
-5. **Verify**:
+5. **Configure `unattended-upgrades` and verify**:
    ```bash
-   echo "Subject: test" | sudo sendmail root
+   /usr/local/bin/mail2hook --print-apt-config | sudo tee /etc/apt/apt.conf.d/52-unattended-upgrades-local >/dev/null
+   printf 'To: root\nFrom: root\nSubject: unattended-upgrades test\n\nHello\n' | sudo sendmail -oi -t
    sudo unattended-upgrade --dry-run --debug
    ```
+   *(On Postfix hosts, set `Unattended-Upgrade::Mail "mail2hook@localhost";` and send the test to `To: mail2hook@localhost`.)*
 
 ---
 

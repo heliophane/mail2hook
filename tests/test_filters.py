@@ -29,7 +29,7 @@ def test_matches_sender_exact() -> None:
 def test_matches_sender_domain() -> None:
     assert matches_sender("root@server01.example.com", ["example.com"]) is True
     assert matches_sender("root@server01.example.com", ["@example.com"]) is True
-    assert matches_sender("root@other.org", ["example.com"]) is False
+    assert matches_sender("root@other.example.org", ["example.com"]) is False
 
 
 def test_matches_sender_username() -> None:
@@ -51,6 +51,39 @@ def test_matches_subject_keywords() -> None:
     assert matches_subject(subject, ["unattended-upgrades"]) is True
     assert matches_subject(subject, ["SUCCESS"]) is True
     assert matches_subject(subject, ["FAILURE", "backup"]) is False
+
+
+def test_matches_subject_unattended_upgrades_filter() -> None:
+    default_filter = ["unattended-upgrades"]
+    assert (
+        matches_subject(
+            "unattended-upgrades result for server01.example.com: SUCCESS",
+            default_filter,
+        )
+        is True
+    )
+    assert (
+        matches_subject(
+            "unattended-upgrades result for server01.example.com: FAILURE",
+            default_filter,
+        )
+        is True
+    )
+    assert (
+        matches_subject(
+            "[reboot required] unattended-upgrades result for pve01.example.com: SUCCESS",
+            default_filter,
+        )
+        is True
+    )
+    assert (
+        matches_subject("Cron <root@server01.example.com> /usr/sbin/logrotate", default_filter)
+        is False
+    )
+    assert (
+        matches_subject("apt-listchanges: news for server01.example.com", default_filter) is False
+    )
+    assert matches_subject("System boot notification", default_filter) is False
 
 
 def test_should_process_message_no_filters() -> None:
@@ -75,7 +108,7 @@ def test_should_process_message_with_filters() -> None:
 
     # Sender mismatch
     msg2 = _make_msg(
-        sender="hacker@other.com",
+        sender="hacker@other.example.com",
         subject="unattended-upgrades result: SUCCESS",
     )
     assert should_process_message(msg2, config) is False

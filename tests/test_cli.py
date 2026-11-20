@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import io
 import json
+import logging
+import syslog
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -40,6 +42,7 @@ def test_cli_print_apt_config(capsys: pytest.CaptureFixture[str]) -> None:
     captured = capsys.readouterr()
     assert "Unattended-Upgrade::Mail" in captured.out
     assert 'Unattended-Upgrade::MailReport "on-change";' in captured.out
+    assert 'Unattended-Upgrade::MailOnlyOnError "false";' in captured.out
     assert "52mail2hook" in captured.out
 
 
@@ -229,3 +232,298 @@ def test_cli_oversized_input(
     assert exit_code == EXIT_DATAERR
     captured = capsys.readouterr()
     assert "exceeds maximum limit" in captured.err
+
+
+def test_cli_postfix_pipe_invocation_unattended_upgrades(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("DISCORD_WEBHOOK_URL", VALID_WEBHOOK_URL)
+    monkeypatch.setenv("FILTER_SUBJECT_KEYWORDS", "unattended-upgrades")
+    raw_eml = (
+        b"From: unattended-upgrades <unattended-upgrades@pve01.example.com>\n"
+        b"To: mail2hook@localhost\n"
+        b"Subject: unattended-upgrades result for pve01.example.com: SUCCESS\n"
+        b"\n"
+        b"Unattended upgrade result: All upgrades installed\n\n"
+        b"Packages that were upgraded:\n"
+        b" nginx\n"
+    )
+    mock_stdin = MagicMock()
+    mock_stdin.buffer = io.BytesIO(raw_eml)
+    monkeypatch.setattr("sys.stdin", mock_stdin)
+
+    with patch("mail2hook.cli.post_to_discord") as mock_post:
+        exit_code = run(
+            [
+                "-oi",
+                "-f",
+                "unattended-upgrades@pve01.example.com",
+                "--",
+                "mail2hook@localhost",
+            ]
+        )
+
+    assert exit_code == EXIT_OK
+    assert mock_post.call_count == 1
+    payload = mock_post.call_args[0][1]
+    embed = payload["embeds"][0]
+    server_field = next(f for f in embed["fields"] if f["name"] == "Server")
+    to_field = next(f for f in embed["fields"] if f["name"] == "To")
+    assert server_field["value"] == "`pve01.example.com`"
+    assert to_field["value"] == "mail2hook@localhost"
+
+
+@pytest.mark.parametrize(
+    "raw_eml",
+    [
+        (
+            b"From: Cron Daemon <root@server01.example.com>\n"
+            b"To: root\n"
+            b"Subject: Cron <root@server01.example.com> /usr/local/bin/backup\n\n"
+            b"Backup completed\n"
+        ),
+        (
+            b"From: root <root@server01.example.com>\n"
+            b"To: root\n"
+            b"Subject: apt-listchanges: news for server01.example.com\n\n"
+            b"Package changelog details\n"
+        ),
+    ],
+)
+def test_cli_default_subject_filter_drops_non_upgrade_mail(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    raw_eml: bytes,
+) -> None:
+    monkeypatch.setenv("DISCORD_WEBHOOK_URL", VALID_WEBHOOK_URL)
+    monkeypatch.setenv("FILTER_SUBJECT_KEYWORDS", "unattended-upgrades")
+    mock_stdin = MagicMock()
+    mock_stdin.buffer = io.BytesIO(raw_eml)
+    monkeypatch.setattr("sys.stdin", mock_stdin)
+
+    with patch("mail2hook.cli.post_to_discord") as mock_post:
+        exit_code = run(["-oi", "-t"])
+
+    assert exit_code == EXIT_OK
+    mock_post.assert_not_called()
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err == ""
+
+
+def test_cli_default_subject_filter_forwards_unattended_upgrades_mail(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("DISCORD_WEBHOOK_URL", VALID_WEBHOOK_URL)
+    monkeypatch.setenv("FILTER_SUBJECT_KEYWORDS", "unattended-upgrades")
+    raw_eml = (
+        b"From: unattended-upgrades <root@server01.example.com>\n"
+        b"To: mail2hook@localhost\n"
+        b"Subject: [reboot required] unattended-upgrades result for server01.example.com: SUCCESS\n"
+        b"\n"
+        b"Unattended upgrade result: All upgrades installed\n"
+    )
+    mock_stdin = MagicMock()
+    mock_stdin.buffer = io.BytesIO(raw_eml)
+    monkeypatch.setattr("sys.stdin", mock_stdin)
+
+    with patch("mail2hook.cli.post_to_discord") as mock_post:
+        exit_code = run(["-oi", "-t"])
+
+    assert exit_code == EXIT_OK
+    assert mock_post.call_count == 1
+
+
+def test_cli_e2e_marker_success_filtered_failure_and_dry_run(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    marker_file = tmp_path / "e2e-confirm"
+    marker_file.touch()
+    monkeypatch.setattr("mail2hook.cli.E2E_MARKER_PATH", marker_file)
+    monkeypatch.setenv("DISCORD_WEBHOOK_URL", VALID_WEBHOOK_URL)
+
+    token = "0123456789abcdef0123456789abcdef"
+    raw_eml = (
+        f"From: root\nTo: mail2hook@localhost\n"
+        f"Subject: unattended-upgrades install test\n"
+        f"X-Mail2Hook-Test-Id: {token}\n\n"
+        f"Hello\n"
+    ).encode("ascii")
+
+    # 1. --dry-run must NOT touch the marker
+    mock_stdin = MagicMock()
+    mock_stdin.buffer = io.BytesIO(raw_eml)
+    monkeypatch.setattr("sys.stdin", mock_stdin)
+    assert run(["--dry-run"]) == EXIT_OK
+    assert marker_file.read_text(encoding="utf-8") == ""
+
+    # 2. Successful delivery writes ok:<token>
+    mock_stdin.buffer = io.BytesIO(raw_eml)
+    with patch("mail2hook.cli.post_to_discord"):
+        assert run([]) == EXIT_OK
+    assert marker_file.read_text(encoding="utf-8") == f"ok:{token}\n"
+
+    # 3. Filtered out writes filtered:<token>
+    monkeypatch.setenv("FILTER_SUBJECT_KEYWORDS", "something-else")
+    mock_stdin.buffer = io.BytesIO(raw_eml)
+    with patch("mail2hook.cli.post_to_discord"):
+        assert run([]) == EXIT_OK
+    assert marker_file.read_text(encoding="utf-8") == f"filtered:{token}\n"
+
+    # 4. Delivery failure writes failed:<code>:<token>
+    monkeypatch.delenv("FILTER_SUBJECT_KEYWORDS")
+    mock_stdin.buffer = io.BytesIO(raw_eml)
+    with patch(
+        "mail2hook.cli.post_to_discord",
+        side_effect=DiscordPermanentError("404 Not Found", status_code=404),
+    ):
+        assert run([]) == EXIT_CONFIG
+    assert marker_file.read_text(encoding="utf-8") == f"failed:78:{token}\n"
+
+    # 5. Config failure writes failed:78:<token>
+    monkeypatch.delenv("DISCORD_WEBHOOK_URL")
+    mock_stdin.buffer = io.BytesIO(raw_eml)
+    assert run([]) == EXIT_CONFIG
+    assert marker_file.read_text(encoding="utf-8") == f"failed:78:{token}\n"
+
+
+def test_cli_e2e_marker_ignores_missing_symlink_and_bad_token(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    token = "0123456789abcdef0123456789abcdef"
+    monkeypatch.setenv("DISCORD_WEBHOOK_URL", VALID_WEBHOOK_URL)
+
+    # 1. Absent marker file is never created
+    absent_marker = tmp_path / "does-not-exist"
+    monkeypatch.setattr("mail2hook.cli.E2E_MARKER_PATH", absent_marker)
+    mock_stdin = MagicMock()
+    mock_stdin.buffer = io.BytesIO(
+        f"Subject: unattended-upgrades test\nX-Mail2Hook-Test-Id: {token}\n\nHi\n".encode("ascii")
+    )
+    monkeypatch.setattr("sys.stdin", mock_stdin)
+    with patch("mail2hook.cli.post_to_discord"):
+        assert run([]) == EXIT_OK
+    assert not absent_marker.exists()
+
+    # 2. Symlink marker is never followed
+    target_file = tmp_path / "protected"
+    target_file.write_text("unchanged", encoding="utf-8")
+    symlink_marker = tmp_path / "e2e-link"
+    symlink_marker.symlink_to(target_file)
+    monkeypatch.setattr("mail2hook.cli.E2E_MARKER_PATH", symlink_marker)
+    mock_stdin.buffer = io.BytesIO(
+        f"Subject: unattended-upgrades test\nX-Mail2Hook-Test-Id: {token}\n\nHi\n".encode("ascii")
+    )
+    with patch("mail2hook.cli.post_to_discord"):
+        assert run([]) == EXIT_OK
+    assert target_file.read_text(encoding="utf-8") == "unchanged"
+
+    # 3. Invalid token does not write marker
+    real_marker = tmp_path / "e2e-real"
+    real_marker.touch()
+    monkeypatch.setattr("mail2hook.cli.E2E_MARKER_PATH", real_marker)
+    mock_stdin.buffer = io.BytesIO(
+        b"Subject: unattended-upgrades test\nX-Mail2Hook-Test-Id: bad-token!\n\nHi\n"
+    )
+    with patch("mail2hook.cli.post_to_discord"):
+        assert run([]) == EXIT_OK
+    assert real_marker.read_text(encoding="utf-8") == ""
+
+
+def test_cli_syslog_logs_invocations_and_redacts_secrets(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    secret_token = "abcdefghijklmnopqrstuvwxyz0123456789"
+    openlog_calls: list[tuple[object, ...]] = []
+    syslog_calls: list[tuple[int, str]] = []
+    monkeypatch.setattr(syslog, "openlog", lambda *args: openlog_calls.append(args))
+    monkeypatch.setattr(syslog, "syslog", lambda prio, msg: syslog_calls.append((prio, msg)))
+
+    raw_eml = (
+        b"Subject: unattended-upgrades test\n"
+        b"From: root@server01.example.com\n\n"
+        b"PRIVATE_BODY_MARKER_SHOULD_NOT_SYSLOG\n"
+    )
+    mock_stdin = MagicMock()
+    monkeypatch.setattr("sys.stdin", mock_stdin)
+    monkeypatch.setenv("DISCORD_WEBHOOK_URL", VALID_WEBHOOK_URL)
+
+    # 1. Posted
+    mock_stdin.buffer = io.BytesIO(raw_eml)
+    with patch("mail2hook.cli.post_to_discord"):
+        assert run([]) == EXIT_OK
+    assert any(c[2] == syslog.LOG_MAIL for c in openlog_calls)
+    joined = "\n".join(msg for _, msg in syslog_calls)
+    assert "received bytes=" in joined
+    assert "outcome=posted" in joined
+    assert "subject='unattended-upgrades test'" in joined
+    assert "exit=0" in joined
+    assert "PRIVATE_BODY_MARKER_SHOULD_NOT_SYSLOG" not in joined
+    assert secret_token not in joined
+
+    # 2. Filtered
+    syslog_calls.clear()
+    monkeypatch.setenv("FILTER_SUBJECT_KEYWORDS", "something-else")
+    mock_stdin.buffer = io.BytesIO(raw_eml)
+    assert run([]) == EXIT_OK
+    joined = "\n".join(msg for _, msg in syslog_calls)
+    assert "outcome=filtered" in joined
+    assert "exit=0" in joined
+
+    # 3. Delivery error with raw webhook URL leaks neither syslog nor stderr
+    syslog_calls.clear()
+    monkeypatch.delenv("FILTER_SUBJECT_KEYWORDS")
+    mock_stdin.buffer = io.BytesIO(raw_eml)
+    with patch(
+        "mail2hook.cli.post_to_discord",
+        side_effect=DiscordTemporaryError(f"failed posting to {VALID_WEBHOOK_URL}"),
+    ):
+        assert run([]) == EXIT_TEMPFAIL
+    err_out = capsys.readouterr().err
+    joined = "\n".join(msg for _, msg in syslog_calls)
+    assert secret_token not in err_out
+    assert "[REDACTED]" in err_out
+    assert secret_token not in joined
+    assert "outcome=delivery_failed" in joined
+    assert "exit=75" in joined
+
+    # 4. Config error logs outcome=config_error
+    syslog_calls.clear()
+    monkeypatch.delenv("DISCORD_WEBHOOK_URL")
+    assert run([]) == EXIT_CONFIG
+    joined = "\n".join(msg for _, msg in syslog_calls)
+    assert "received outcome=config_error" in joined
+    assert "exit=78" in joined
+    capsys.readouterr()
+
+
+def test_cli_filtered_out_visible_under_verbose_and_dry_run(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    monkeypatch.setenv("DISCORD_WEBHOOK_URL", VALID_WEBHOOK_URL)
+    monkeypatch.setenv("FILTER_SUBJECT_KEYWORDS", "only-this-subject")
+    fixture_path = str(FIXTURES_DIR / "unattended_upgrades_success.eml")
+
+    # --dry-run prints drop notice to stderr without JSON on stdout
+    assert run(["--file", fixture_path, "--dry-run"]) == EXIT_OK
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert "filtered out message" in captured.err
+
+    # -v emits INFO log for the filtered drop
+    caplog.set_level(logging.INFO)
+    assert run(["--file", fixture_path, "-v"]) == EXIT_OK
+    assert "Filtered out message" in caplog.text
+
+
+def test_cli_missing_env_file_exits_config(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], tmp_path: Path
+) -> None:
+    monkeypatch.setenv("DISCORD_WEBHOOK_URL", VALID_WEBHOOK_URL)
+    missing_env = tmp_path / "missing.env"
+    code = run(["--env-file", str(missing_env)])
+    captured = capsys.readouterr()
+    assert code == EXIT_CONFIG
+    assert "Configuration file not found or unreadable" in captured.err

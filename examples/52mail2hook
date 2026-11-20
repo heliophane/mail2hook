@@ -12,7 +12,10 @@ APT::Periodic::Unattended-Upgrade "1";
 APT::Periodic::AutocleanInterval "7";
 
 // 2. Deliver upgrade reports to mail2hook
-// When mail2hook is linked to /usr/sbin/sendmail, unattended-upgrades delivers directly to mail2hook.
+// When mail2hook is linked to /usr/sbin/sendmail, use "root" (paired with
+// FILTER_SUBJECT_KEYWORDS=unattended-upgrades in /etc/mail2hook/env).
+// On Postfix hosts using the mail2hook pipe transport, use "mail2hook@localhost":
+//   Unattended-Upgrade::Mail "mail2hook@localhost";
 Unattended-Upgrade::Mail "root";
 
 // 3. Reporting frequency:
@@ -20,6 +23,7 @@ Unattended-Upgrade::Mail "root";
 // - "always": Send a Discord notification on every upgrade run, even with zero changes
 // - "only-on-error": Send a Discord notification only when an upgrade fails
 Unattended-Upgrade::MailReport "on-change";
+Unattended-Upgrade::MailOnlyOnError "false";
 
 // 4. Sender identity for clean email headers
 Unattended-Upgrade::Sender "unattended-upgrades";
