@@ -25,6 +25,7 @@ VALID_CANARY_WEBHOOK_URL = (
 
 def test_validate_webhook_url_success() -> None:
     assert validate_webhook_url(VALID_WEBHOOK_URL) == VALID_WEBHOOK_URL
+    assert validate_webhook_url(f"  {VALID_WEBHOOK_URL}/  ") == VALID_WEBHOOK_URL
     assert validate_webhook_url(VALID_CANARY_WEBHOOK_URL) == VALID_CANARY_WEBHOOK_URL
 
 
