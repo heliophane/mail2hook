@@ -28,10 +28,11 @@ Standard Linux tools (`unattended-upgrades`, `cron`, `apt-listchanges`) deliver 
 
 ### Interaction With an Existing MTA
 
-- **Hosts with Postfix** (e.g. Proxmox VE or mail-enabled Debian/Ubuntu hosts): `install.sh` **leaves `/usr/sbin/sendmail` untouched** so existing root/admin mail forwarding continues working. Instead, it configures `mail2hook` alongside Postfix automatically:
+- **Hosts with Postfix** (e.g. Proxmox VE or mail-enabled Debian/Ubuntu hosts): `install.sh` **leaves `/usr/sbin/sendmail` untouched** so existing root/admin mail forwarding continues working. Instead, it configures `mail2hook` alongside Postfix so **only `unattended-upgrades` reports** go to Discord:
   - Adds a managed `mail2hook` pipe transport to `/etc/postfix/master.cf` (`flags=R user=nobody:mail argv=/usr/local/bin/mail2hook -oi -f ${sender} -- ${recipient}`).
-  - Creates `/etc/postfix/mail2hook_transport` (`mail2hook@localhost mail2hook:`), compiles it with `postmap`, prepends it to `transport_maps`, and sets `mail2hook_destination_recipient_limit = 1` in `/etc/postfix/main.cf`.
-  - Sets `Unattended-Upgrade::Mail` to preserve your existing target plus `mail2hook@localhost` (e.g. `"root, mail2hook@localhost"`), so both your admin inbox and Discord receive reports.
+  - Creates `/etc/postfix/mail2hook_transport` (`mail2hook@localhost mail2hook:`), compiles it with `postmap`, prepends it to `transport_maps`, and sets `mail2hook_destination_recipient_limit = 1` in `/etc/postfix/main.cf`. Other `root` mail is never captured or diverted.
+  - Replaces `Unattended-Upgrade::Mail` with `"mail2hook@localhost"` (backing up the previous target in `/var/backups/mail2hook/` and restoring it on `--uninstall`).
+  - Sets `FILTER_SUBJECT_KEYWORDS=unattended-upgrades` in `/etc/mail2hook/env` (if unset) as defense in depth.
   - Saves backups of modified files in `/var/backups/mail2hook/`.
 
   Manual Postfix pipe setup (if configuring by hand):
@@ -69,8 +70,8 @@ curl -fsSL https://raw.githubusercontent.com/heliophane/mail2hook/main/install.s
 The installer:
 1. Detects the OS and installs minimal dependencies (`python3`, `ca-certificates`, `curl`, and `unattended-upgrades`).
 2. Installs `/usr/local/bin/mail2hook` (zipapp pinned to `/usr/bin/python3 -sE`) and either configures a dedicated Postfix pipe (`mail2hook@localhost`, leaving `/usr/sbin/sendmail` untouched) or links `/usr/sbin/sendmail` via `update-alternatives` on hosts without an MTA.
-3. Prompts securely for your Discord webhook URL via `/dev/tty` (hidden input) and writes `/etc/mail2hook/env`.
-4. Configures conservative, nightly **security-only** `unattended-upgrades` (`Mail "root"` or `"root, mail2hook@localhost"` with Postfix, `MailReport "on-change"`, `MailOnlyOnError "false"`, `Automatic-Reboot "false"`). No `mailx` package is needed because `unattended-upgrades` invokes `/usr/sbin/sendmail` directly.
+3. Prompts securely for your Discord webhook URL via `/dev/tty` (hidden input) and writes `/etc/mail2hook/env` (defaulting `FILTER_SUBJECT_KEYWORDS=unattended-upgrades` so non-upgrade mail such as `cron` or `apt-listchanges` is dropped silently with exit `0`).
+4. Configures conservative, nightly **security-only** `unattended-upgrades` (`Mail "mail2hook@localhost"` with Postfix or `Mail "root"` with the `sendmail` shim, `MailReport "on-change"`, `MailOnlyOnError "false"`, `Automatic-Reboot "false"`). No `mailx` package is needed because `unattended-upgrades` invokes `/usr/sbin/sendmail` directly.
 5. Sends an end-to-end test message and reports all changes and backups (saved in `/var/backups/mail2hook/`).
 
 ### Supported Operating Systems
@@ -125,8 +126,9 @@ DISCORD_WEBHOOK_URL=https://discord.com/api/webhooks/123456789012345678/example-
 # Optional: Comma-separated sender addresses or domains to match (unset = match all)
 # FILTER_SENDERS=
 
-# Optional: Comma-separated subject keywords to match, case-insensitive (unset = match all)
-# FILTER_SUBJECT_KEYWORDS=
+# Optional: Comma-separated subject keywords to match, case-insensitive.
+# install.sh defaults this to unattended-upgrades; set empty to match all subjects.
+FILTER_SUBJECT_KEYWORDS=unattended-upgrades
 
 # Optional: Maximum body characters in the Discord embed excerpt (default: 1500)
 # MAX_BODY_CHARS=1500
@@ -144,13 +146,13 @@ Never pass the webhook URL on a command line.
 ### Send a test message through `sendmail`
 
 ```bash
-printf 'To: root\nFrom: root\nSubject: test\n\nHello from mail2hook\n' | sudo sendmail -oi -t
+printf 'To: root\nFrom: root\nSubject: unattended-upgrades test on %s\n\nHello from mail2hook\n' "$(hostname)" | sudo sendmail -oi -t
 ```
 
 On Postfix hosts configured with the `mail2hook` pipe transport, address the test to `mail2hook@localhost`:
 
 ```bash
-printf 'To: mail2hook@localhost\nFrom: root\nSubject: test\n\nHello via Postfix\n' | sudo sendmail -oi -t
+printf 'To: mail2hook@localhost\nFrom: root\nSubject: unattended-upgrades test on %s\n\nHello via Postfix\n' "$(hostname)" | sudo sendmail -oi -t
 ```
 
 Or test a simulated `unattended-upgrades` message:
@@ -162,7 +164,7 @@ printf 'To: root\nFrom: root\nSubject: unattended-upgrades result for %s: SUCCES
 ### Dry-run locally without calling Discord
 
 ```bash
-printf 'Subject: Test\nFrom: root\n\nHello\n' | sudo mail2hook --dry-run
+printf 'Subject: unattended-upgrades test\nFrom: root\n\nHello\n' | sudo mail2hook --dry-run
 ```
 
 ---
@@ -227,7 +229,7 @@ curl -fsSL https://raw.githubusercontent.com/heliophane/mail2hook/main/install.s
 sudo ./install.sh --uninstall
 ```
 
-This removes `/usr/local/bin/mail2hook`, cleanly removes any Postfix pipe/transport additions (`main.cf`, `master.cf`, `/etc/postfix/mail2hook_transport*`, and `mail2hook@localhost` in `52-unattended-upgrades-local`) as well as the `mta` alternative, and asks before deleting `/etc/mail2hook/env`. Backups of modified configs are preserved under `/var/backups/mail2hook/`. Pass `--purge-upgrades` as well if you also want to remove the `unattended-upgrades` drop-in files and timer overrides.
+This removes `/usr/local/bin/mail2hook`, cleanly removes any Postfix pipe/transport additions (`main.cf`, `master.cf`, `/etc/postfix/mail2hook_transport*`), restores the original `Unattended-Upgrade::Mail` target in `52-unattended-upgrades-local`, removes the `mta` alternative if linked, and asks before deleting `/etc/mail2hook/env`. Backups of modified configs are preserved under `/var/backups/mail2hook/`. Pass `--purge-upgrades` as well if you also want to remove the `unattended-upgrades` drop-in files and timer overrides.
 
 ---
 
