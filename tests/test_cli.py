@@ -232,11 +232,14 @@ def test_cli_oversized_input(
     assert "exceeds maximum limit" in captured.err
 
 
-def test_cli_postfix_pipe_invocation_dual_recipient(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_cli_postfix_pipe_invocation_unattended_upgrades(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     monkeypatch.setenv("DISCORD_WEBHOOK_URL", VALID_WEBHOOK_URL)
+    monkeypatch.setenv("FILTER_SUBJECT_KEYWORDS", "unattended-upgrades")
     raw_eml = (
         b"From: unattended-upgrades <unattended-upgrades@pve01.example.com>\n"
-        b"To: root, mail2hook@localhost\n"
+        b"To: mail2hook@localhost\n"
         b"Subject: unattended-upgrades result for pve01.example.com: SUCCESS\n"
         b"\n"
         b"Unattended upgrade result: All upgrades installed\n\n"
@@ -265,4 +268,65 @@ def test_cli_postfix_pipe_invocation_dual_recipient(monkeypatch: pytest.MonkeyPa
     server_field = next(f for f in embed["fields"] if f["name"] == "Server")
     to_field = next(f for f in embed["fields"] if f["name"] == "To")
     assert server_field["value"] == "`pve01.example.com`"
-    assert to_field["value"] == "root, mail2hook@localhost"
+    assert to_field["value"] == "mail2hook@localhost"
+
+
+@pytest.mark.parametrize(
+    "raw_eml",
+    [
+        (
+            b"From: Cron Daemon <root@server01.example.com>\n"
+            b"To: root\n"
+            b"Subject: Cron <root@server01.example.com> /usr/local/bin/backup\n\n"
+            b"Backup completed\n"
+        ),
+        (
+            b"From: root <root@server01.example.com>\n"
+            b"To: root\n"
+            b"Subject: apt-listchanges: news for server01.example.com\n\n"
+            b"Package changelog details\n"
+        ),
+    ],
+)
+def test_cli_default_subject_filter_drops_non_upgrade_mail(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    raw_eml: bytes,
+) -> None:
+    monkeypatch.setenv("DISCORD_WEBHOOK_URL", VALID_WEBHOOK_URL)
+    monkeypatch.setenv("FILTER_SUBJECT_KEYWORDS", "unattended-upgrades")
+    mock_stdin = MagicMock()
+    mock_stdin.buffer = io.BytesIO(raw_eml)
+    monkeypatch.setattr("sys.stdin", mock_stdin)
+
+    with patch("mail2hook.cli.post_to_discord") as mock_post:
+        exit_code = run(["-oi", "-t"])
+
+    assert exit_code == EXIT_OK
+    mock_post.assert_not_called()
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err == ""
+
+
+def test_cli_default_subject_filter_forwards_unattended_upgrades_mail(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("DISCORD_WEBHOOK_URL", VALID_WEBHOOK_URL)
+    monkeypatch.setenv("FILTER_SUBJECT_KEYWORDS", "unattended-upgrades")
+    raw_eml = (
+        b"From: unattended-upgrades <root@server01.example.com>\n"
+        b"To: mail2hook@localhost\n"
+        b"Subject: [reboot required] unattended-upgrades result for server01.example.com: SUCCESS\n"
+        b"\n"
+        b"Unattended upgrade result: All upgrades installed\n"
+    )
+    mock_stdin = MagicMock()
+    mock_stdin.buffer = io.BytesIO(raw_eml)
+    monkeypatch.setattr("sys.stdin", mock_stdin)
+
+    with patch("mail2hook.cli.post_to_discord") as mock_post:
+        exit_code = run(["-oi", "-t"])
+
+    assert exit_code == EXIT_OK
+    assert mock_post.call_count == 1

@@ -53,6 +53,39 @@ def test_matches_subject_keywords() -> None:
     assert matches_subject(subject, ["FAILURE", "backup"]) is False
 
 
+def test_matches_subject_unattended_upgrades_filter() -> None:
+    default_filter = ["unattended-upgrades"]
+    assert (
+        matches_subject(
+            "unattended-upgrades result for server01.example.com: SUCCESS",
+            default_filter,
+        )
+        is True
+    )
+    assert (
+        matches_subject(
+            "unattended-upgrades result for server01.example.com: FAILURE",
+            default_filter,
+        )
+        is True
+    )
+    assert (
+        matches_subject(
+            "[reboot required] unattended-upgrades result for pve01.example.com: SUCCESS",
+            default_filter,
+        )
+        is True
+    )
+    assert (
+        matches_subject("Cron <root@server01.example.com> /usr/sbin/logrotate", default_filter)
+        is False
+    )
+    assert (
+        matches_subject("apt-listchanges: news for server01.example.com", default_filter) is False
+    )
+    assert matches_subject("System boot notification", default_filter) is False
+
+
 def test_should_process_message_no_filters() -> None:
     config = Config(discord_webhook_url="https://discord.com/api/webhooks/123/token")
     msg = _make_msg()
