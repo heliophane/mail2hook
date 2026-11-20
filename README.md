@@ -28,16 +28,33 @@ Standard Linux tools (`unattended-upgrades`, `cron`, `apt-listchanges`) deliver 
 
 ### Interaction With an Existing MTA
 
-If another Mail Transfer Agent (`postfix`, `exim4`, `msmtp`, `nullmailer`, etc.) is already installed or owns `/usr/sbin/sendmail`, `install.sh` **detects it, warns you, and leaves `/usr/sbin/sendmail` untouched** so it never silently breaks existing mail routing.
+- **Hosts with Postfix** (e.g. Proxmox VE or mail-enabled Debian/Ubuntu hosts): `install.sh` **leaves `/usr/sbin/sendmail` untouched** so existing root/admin mail forwarding continues working. Instead, it configures `mail2hook` alongside Postfix automatically:
+  - Adds a managed `mail2hook` pipe transport to `/etc/postfix/master.cf` (`flags=R user=nobody:mail argv=/usr/local/bin/mail2hook -oi -f ${sender} -- ${recipient}`).
+  - Creates `/etc/postfix/mail2hook_transport` (`mail2hook@localhost mail2hook:`), compiles it with `postmap`, prepends it to `transport_maps`, and sets `mail2hook_destination_recipient_limit = 1` in `/etc/postfix/main.cf`.
+  - Sets `Unattended-Upgrade::Mail` to preserve your existing target plus `mail2hook@localhost` (e.g. `"root, mail2hook@localhost"`), so both your admin inbox and Discord receive reports.
+  - Saves backups of modified files in `/var/backups/mail2hook/`.
 
-You can then choose either option:
-- **Use `mail2hook` directly as `sendmail`**: Remove the existing MTA package (e.g. `sudo apt purge postfix` or `sudo apt purge 'exim4*'`) and re-run `install.sh`.
-- **Keep your existing MTA (e.g. Postfix)**: Configure a pipe transport in `/etc/postfix/master.cf` pointing to `/usr/local/bin/mail2hook`:
-  ```text
-  mail2hook unix  -       n       n       -       -       pipe
-    flags=FR user=nobody argv=/usr/local/bin/mail2hook
-  ```
-  and route target addresses (e.g. `mail2hook@localhost mail2hook:`) via `/etc/postfix/transport`.
+  Manual Postfix pipe setup (if configuring by hand):
+  1. Add to `/etc/postfix/master.cf`:
+     ```text
+     mail2hook unix  -       n       n       -       -       pipe
+       flags=R user=nobody:mail argv=/usr/local/bin/mail2hook -oi -f ${sender} -- ${recipient}
+     ```
+  2. Create `/etc/postfix/mail2hook_transport`:
+     ```text
+     mail2hook@localhost mail2hook:
+     mail2hook@localhost.localdomain mail2hook:
+     ```
+  3. Compile, configure `main.cf`, verify, and reload:
+     ```bash
+     sudo postmap /etc/postfix/mail2hook_transport
+     sudo postconf -e "transport_maps = hash:/etc/postfix/mail2hook_transport"
+     sudo postconf -e "mail2hook_destination_recipient_limit = 1"
+     sudo postfix check && sudo systemctl reload postfix
+     ```
+     *(If Postfix already has a `transport_maps` entry, prepend `hash:/etc/postfix/mail2hook_transport` or `lmdb:/etc/postfix/mail2hook_transport` matching `postconf -h default_database_type`.)*
+
+- **Hosts with another MTA (`exim4`, `msmtp-mta`, `nullmailer`, `dma`, etc.)**: `install.sh` detects it, warns, and leaves `/usr/sbin/sendmail` untouched. Either remove the conflicting MTA (`sudo apt purge 'exim4*'`) and re-run `install.sh`, or configure that MTA to pipe mail to `/usr/local/bin/mail2hook`.
 
 ---
 
@@ -51,10 +68,10 @@ curl -fsSL https://raw.githubusercontent.com/heliophane/mail2hook/main/install.s
 
 The installer:
 1. Detects the OS and installs minimal dependencies (`python3`, `ca-certificates`, `curl`, and `unattended-upgrades`).
-2. Installs `/usr/local/bin/mail2hook` and links `/usr/sbin/sendmail` via `update-alternatives` (unless another MTA owns it).
+2. Installs `/usr/local/bin/mail2hook` (zipapp pinned to `/usr/bin/python3 -sE`) and either configures a dedicated Postfix pipe (`mail2hook@localhost`, leaving `/usr/sbin/sendmail` untouched) or links `/usr/sbin/sendmail` via `update-alternatives` on hosts without an MTA.
 3. Prompts securely for your Discord webhook URL via `/dev/tty` (hidden input) and writes `/etc/mail2hook/env`.
-4. Configures conservative, nightly **security-only** `unattended-upgrades` (`Mail "root"`, `MailReport "on-change"` so Discord notifies on changes/errors and stays quiet on no-op runs, `Automatic-Reboot "false"`). No `mailx` package is needed because `unattended-upgrades` invokes `/usr/sbin/sendmail` directly.
-5. Sends an end-to-end test message through `sendmail` and reports the result.
+4. Configures conservative, nightly **security-only** `unattended-upgrades` (`Mail "root"` or `"root, mail2hook@localhost"` with Postfix, `MailReport "on-change"`, `MailOnlyOnError "false"`, `Automatic-Reboot "false"`). No `mailx` package is needed because `unattended-upgrades` invokes `/usr/sbin/sendmail` directly.
+5. Sends an end-to-end test message and reports all changes and backups (saved in `/var/backups/mail2hook/`).
 
 ### Supported Operating Systems
 
@@ -69,19 +86,18 @@ The installer:
 
 | Flag | Description |
 | :--- | :--- |
-| `--webhook-url <url>` | Set the Discord webhook URL non-interactively (also reads `DISCORD_WEBHOOK_URL` from the environment). |
 | `--skip-upgrades` | Install `mail2hook` only; skip installing and configuring `unattended-upgrades`. |
-| `--yes`, `-y` | Non-interactive mode; keep existing valid config and accept defaults without prompting. |
-| `--uninstall` | Remove `/usr/local/bin/mail2hook` and its `sendmail`/`mailq` alternative (restoring any prior alternative), and prompt before deleting `/etc/mail2hook`. |
+| `--yes`, `-y` | Non-interactive mode; read `DISCORD_WEBHOOK_URL` from the environment or keep existing valid `/etc/mail2hook/env`, and accept defaults without prompting. |
+| `--uninstall` | Remove `/usr/local/bin/mail2hook`, cleanly remove any Postfix pipe/transport additions and `sendmail`/`mailq` alternative, and prompt before deleting `/etc/mail2hook`. |
 | `--purge-upgrades` | Used with `--uninstall` to also remove the `unattended-upgrades` drop-ins and timer overrides. |
 | `--help`, `-h` | Show usage information and exit. |
 
-Non-interactive example:
+Non-interactive example (pass the secret via environment variable, never CLI arguments):
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/heliophane/mail2hook/main/install.sh | sudo bash -s -- \
-  --webhook-url "https://discord.com/api/webhooks/123456789012345678/example-token-placeholder" \
-  --yes
+export DISCORD_WEBHOOK_URL="https://discord.com/api/webhooks/123456789012345678/example-token-placeholder"
+curl -fsSL https://raw.githubusercontent.com/heliophane/mail2hook/main/install.sh \
+  | sudo --preserve-env=DISCORD_WEBHOOK_URL bash -s -- --yes
 ```
 
 For multi-server deployment details and manual installation steps, see [docs/MULTI_SERVER_SETUP.md](docs/MULTI_SERVER_SETUP.md).
@@ -128,13 +144,19 @@ Never pass the webhook URL on a command line.
 ### Send a test message through `sendmail`
 
 ```bash
-echo "Subject: test" | sudo sendmail root
+printf 'To: root\nFrom: root\nSubject: test\n\nHello from mail2hook\n' | sudo sendmail -oi -t
+```
+
+On Postfix hosts configured with the `mail2hook` pipe transport, address the test to `mail2hook@localhost`:
+
+```bash
+printf 'To: mail2hook@localhost\nFrom: root\nSubject: test\n\nHello via Postfix\n' | sudo sendmail -oi -t
 ```
 
 Or test a simulated `unattended-upgrades` message:
 
 ```bash
-printf 'Subject: unattended-upgrades result for %s: SUCCESS\nFrom: root\n\nAll upgrades installed.\nPackages that were upgraded:\n libssl3 openssl\n' "$(hostname)" | sudo sendmail -t -oi root
+printf 'To: root\nFrom: root\nSubject: unattended-upgrades result for %s: SUCCESS\n\nAll upgrades installed.\nPackages that were upgraded:\n libssl3 openssl\n' "$(hostname)" | sudo sendmail -t -oi
 ```
 
 ### Dry-run locally without calling Discord
@@ -205,7 +227,7 @@ curl -fsSL https://raw.githubusercontent.com/heliophane/mail2hook/main/install.s
 sudo ./install.sh --uninstall
 ```
 
-This removes `/usr/local/bin/mail2hook`, cleans up its `mta` alternative (restoring any prior alternative), and asks before deleting `/etc/mail2hook/env`. Pass `--purge-upgrades` as well if you also want to remove the `unattended-upgrades` drop-in files and timer overrides.
+This removes `/usr/local/bin/mail2hook`, cleanly removes any Postfix pipe/transport additions (`main.cf`, `master.cf`, `/etc/postfix/mail2hook_transport*`, and `mail2hook@localhost` in `52-unattended-upgrades-local`) as well as the `mta` alternative, and asks before deleting `/etc/mail2hook/env`. Backups of modified configs are preserved under `/var/backups/mail2hook/`. Pass `--purge-upgrades` as well if you also want to remove the `unattended-upgrades` drop-in files and timer overrides.
 
 ---
 

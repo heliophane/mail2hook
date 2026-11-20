@@ -49,6 +49,7 @@ Unattended-Upgrade::Mail "root";
 // - "always": Send a Discord notification on every upgrade run, even with zero changes
 // - "only-on-error": Send a Discord notification only when an upgrade fails
 Unattended-Upgrade::MailReport "on-change";
+Unattended-Upgrade::MailOnlyOnError "false";
 
 // 4. Sender identity for clean email headers
 Unattended-Upgrade::Sender "unattended-upgrades";
