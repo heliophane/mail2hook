@@ -5,7 +5,11 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import os
+import re
+import stat
 import sys
+from email.parser import BytesHeaderParser
 from pathlib import Path
 
 from mail2hook import __version__
@@ -20,6 +24,9 @@ from mail2hook.filters import should_process_message
 from mail2hook.parse import ParseError, parse_email
 
 MAX_MESSAGE_BYTES = 10 * 1024 * 1024  # 10 MiB
+E2E_MARKER_PATH = Path("/run/mail2hook/e2e-confirm")
+_E2E_TEST_ID_HEADER = "X-Mail2Hook-Test-Id"
+_E2E_TEST_ID_RE = re.compile(r"^[0-9a-f]{16,64}$")
 
 # Postfix / sysexits.h standard exit codes
 EXIT_OK = 0  # EX_OK: Success or message filtered out
@@ -213,6 +220,58 @@ def _normalize_sendmail_input(raw_bytes: bytes, *, ignore_dots: bool) -> bytes:
     return b"".join(out_lines)
 
 
+def _write_e2e_marker(raw_bytes: bytes, status: str) -> None:
+    """Write a safe E2E confirmation marker only when pre-created as a regular file."""
+    try:
+        st = os.lstat(E2E_MARKER_PATH)
+    except OSError:
+        return
+    if not stat.S_ISREG(st.st_mode):
+        return
+
+    try:
+        header_val = BytesHeaderParser().parsebytes(raw_bytes).get(_E2E_TEST_ID_HEADER, "")
+    except Exception:
+        return
+
+    test_id = str(header_val).strip().lower()
+    if not _E2E_TEST_ID_RE.fullmatch(test_id):
+        return
+
+    payload = f"{status}:{test_id}\n".encode("ascii")
+    try:
+        fd = os.open(E2E_MARKER_PATH, os.O_WRONLY | os.O_NOFOLLOW | os.O_TRUNC)
+        try:
+            os.write(fd, payload)
+        finally:
+            os.close(fd)
+    except OSError:
+        pass
+
+
+def _maybe_mark_config_failure(args: argparse.Namespace) -> None:
+    """Record a config failure marker if E2E marker exists and stdin/file holds a valid token."""
+    if getattr(args, "dry_run", False):
+        return
+    try:
+        st = os.lstat(E2E_MARKER_PATH)
+    except OSError:
+        return
+    if not stat.S_ISREG(st.st_mode):
+        return
+
+    try:
+        if args.file is not None and args.file.is_file():
+            raw_bytes = args.file.read_bytes()[:65536]
+        elif args.file is None:
+            raw_bytes = sys.stdin.buffer.read(65536)
+        else:
+            return
+    except Exception:
+        return
+    _write_e2e_marker(raw_bytes, f"failed:{EXIT_CONFIG}")
+
+
 def run(argv: list[str] | None = None) -> int:
     """Execute mail2hook CLI and return the appropriate exit code."""
     parser = build_parser()
@@ -240,9 +299,11 @@ def run(argv: list[str] | None = None) -> int:
     try:
         config = load_config(env_file=args.env_file)
     except ConfigError as err:
+        _maybe_mark_config_failure(args)
         sys.stderr.write(f"mail2hook: configuration error: {err}\n")
         return EXIT_CONFIG
     except Exception as err:
+        _maybe_mark_config_failure(args)
         sys.stderr.write(f"mail2hook: unexpected error loading config: {err}\n")
         return EXIT_CONFIG
 
@@ -282,14 +343,20 @@ def run(argv: list[str] | None = None) -> int:
             fallback_to=fallback_to,
         )
     except ParseError as err:
+        if not args.dry_run:
+            _write_e2e_marker(raw_bytes, f"failed:{EXIT_DATAERR}")
         sys.stderr.write(f"mail2hook: unparseable email data: {err}\n")
         return EXIT_DATAERR
     except Exception as err:
+        if not args.dry_run:
+            _write_e2e_marker(raw_bytes, f"failed:{EXIT_DATAERR}")
         sys.stderr.write(f"mail2hook: unexpected parsing error: {err}\n")
         return EXIT_DATAERR
 
     # 4. Apply filters (silently exit 0 if not matched)
     if not should_process_message(msg, config):
+        if not args.dry_run:
+            _write_e2e_marker(raw_bytes, "filtered")
         return EXIT_OK
 
     # 5. Build Discord payload
@@ -304,17 +371,20 @@ def run(argv: list[str] | None = None) -> int:
     try:
         post_to_discord(config.discord_webhook_url, payload)
     except DiscordTemporaryError as err:
+        _write_e2e_marker(raw_bytes, f"failed:{EXIT_TEMPFAIL}")
         sys.stderr.write(f"mail2hook: temporary failure sending to Discord: {err}\n")
         return EXIT_TEMPFAIL
     except DiscordPermanentError as err:
+        exit_code = EXIT_CONFIG if err.status_code in (401, 403, 404) else EXIT_DATAERR
+        _write_e2e_marker(raw_bytes, f"failed:{exit_code}")
         sys.stderr.write(f"mail2hook: permanent failure sending to Discord: {err}\n")
-        if err.status_code in (401, 403, 404):
-            return EXIT_CONFIG
-        return EXIT_DATAERR
+        return exit_code
     except Exception as err:
+        _write_e2e_marker(raw_bytes, f"failed:{EXIT_TEMPFAIL}")
         sys.stderr.write(f"mail2hook: unexpected error sending to Discord: {err}\n")
         return EXIT_TEMPFAIL
 
+    _write_e2e_marker(raw_bytes, "ok")
     return EXIT_OK
 
 

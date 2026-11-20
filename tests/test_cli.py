@@ -330,3 +330,99 @@ def test_cli_default_subject_filter_forwards_unattended_upgrades_mail(
 
     assert exit_code == EXIT_OK
     assert mock_post.call_count == 1
+
+
+def test_cli_e2e_marker_success_filtered_failure_and_dry_run(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    marker_file = tmp_path / "e2e-confirm"
+    marker_file.touch()
+    monkeypatch.setattr("mail2hook.cli.E2E_MARKER_PATH", marker_file)
+    monkeypatch.setenv("DISCORD_WEBHOOK_URL", VALID_WEBHOOK_URL)
+
+    token = "0123456789abcdef0123456789abcdef"
+    raw_eml = (
+        f"From: root\nTo: mail2hook@localhost\n"
+        f"Subject: unattended-upgrades install test\n"
+        f"X-Mail2Hook-Test-Id: {token}\n\n"
+        f"Hello\n"
+    ).encode("ascii")
+
+    # 1. --dry-run must NOT touch the marker
+    mock_stdin = MagicMock()
+    mock_stdin.buffer = io.BytesIO(raw_eml)
+    monkeypatch.setattr("sys.stdin", mock_stdin)
+    assert run(["--dry-run"]) == EXIT_OK
+    assert marker_file.read_text(encoding="utf-8") == ""
+
+    # 2. Successful delivery writes ok:<token>
+    mock_stdin.buffer = io.BytesIO(raw_eml)
+    with patch("mail2hook.cli.post_to_discord"):
+        assert run([]) == EXIT_OK
+    assert marker_file.read_text(encoding="utf-8") == f"ok:{token}\n"
+
+    # 3. Filtered out writes filtered:<token>
+    monkeypatch.setenv("FILTER_SUBJECT_KEYWORDS", "something-else")
+    mock_stdin.buffer = io.BytesIO(raw_eml)
+    with patch("mail2hook.cli.post_to_discord"):
+        assert run([]) == EXIT_OK
+    assert marker_file.read_text(encoding="utf-8") == f"filtered:{token}\n"
+
+    # 4. Delivery failure writes failed:<code>:<token>
+    monkeypatch.delenv("FILTER_SUBJECT_KEYWORDS")
+    mock_stdin.buffer = io.BytesIO(raw_eml)
+    with patch(
+        "mail2hook.cli.post_to_discord",
+        side_effect=DiscordPermanentError("404 Not Found", status_code=404),
+    ):
+        assert run([]) == EXIT_CONFIG
+    assert marker_file.read_text(encoding="utf-8") == f"failed:78:{token}\n"
+
+    # 5. Config failure writes failed:78:<token>
+    monkeypatch.delenv("DISCORD_WEBHOOK_URL")
+    mock_stdin.buffer = io.BytesIO(raw_eml)
+    assert run([]) == EXIT_CONFIG
+    assert marker_file.read_text(encoding="utf-8") == f"failed:78:{token}\n"
+
+
+def test_cli_e2e_marker_ignores_missing_symlink_and_bad_token(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    token = "0123456789abcdef0123456789abcdef"
+    monkeypatch.setenv("DISCORD_WEBHOOK_URL", VALID_WEBHOOK_URL)
+
+    # 1. Absent marker file is never created
+    absent_marker = tmp_path / "does-not-exist"
+    monkeypatch.setattr("mail2hook.cli.E2E_MARKER_PATH", absent_marker)
+    mock_stdin = MagicMock()
+    mock_stdin.buffer = io.BytesIO(
+        f"Subject: unattended-upgrades test\nX-Mail2Hook-Test-Id: {token}\n\nHi\n".encode("ascii")
+    )
+    monkeypatch.setattr("sys.stdin", mock_stdin)
+    with patch("mail2hook.cli.post_to_discord"):
+        assert run([]) == EXIT_OK
+    assert not absent_marker.exists()
+
+    # 2. Symlink marker is never followed
+    target_file = tmp_path / "protected"
+    target_file.write_text("unchanged", encoding="utf-8")
+    symlink_marker = tmp_path / "e2e-link"
+    symlink_marker.symlink_to(target_file)
+    monkeypatch.setattr("mail2hook.cli.E2E_MARKER_PATH", symlink_marker)
+    mock_stdin.buffer = io.BytesIO(
+        f"Subject: unattended-upgrades test\nX-Mail2Hook-Test-Id: {token}\n\nHi\n".encode("ascii")
+    )
+    with patch("mail2hook.cli.post_to_discord"):
+        assert run([]) == EXIT_OK
+    assert target_file.read_text(encoding="utf-8") == "unchanged"
+
+    # 3. Invalid token does not write marker
+    real_marker = tmp_path / "e2e-real"
+    real_marker.touch()
+    monkeypatch.setattr("mail2hook.cli.E2E_MARKER_PATH", real_marker)
+    mock_stdin.buffer = io.BytesIO(
+        b"Subject: unattended-upgrades test\nX-Mail2Hook-Test-Id: bad-token!\n\nHi\n"
+    )
+    with patch("mail2hook.cli.post_to_discord"):
+        assert run([]) == EXIT_OK
+    assert real_marker.read_text(encoding="utf-8") == ""
