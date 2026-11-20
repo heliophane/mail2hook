@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import syslog
 from pathlib import Path
 
 import pytest
@@ -40,3 +41,5 @@ def isolate_host_state(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
         "mail2hook.parse.DEFAULT_DPKG_LOG_PATHS",
         (tmp_path / "nonexistent-dpkg.log",),
     )
+    monkeypatch.setattr(syslog, "openlog", lambda *args, **kwargs: None)
+    monkeypatch.setattr(syslog, "syslog", lambda *args, **kwargs: None)
