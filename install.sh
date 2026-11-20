@@ -40,6 +40,8 @@ readonly LEGACY_SERVICE_WANT="/etc/systemd/system/multi-user.target.wants/mail2h
 readonly APT_AUTO_UPGRADES="/etc/apt/apt.conf.d/20auto-upgrades"
 readonly APT_LOCAL_UPGRADES="/etc/apt/apt.conf.d/52-unattended-upgrades-local"
 readonly APT_LEGACY_MAIL2HOOK="/etc/apt/apt.conf.d/52mail2hook"
+readonly APT_MAIL_ORIG_BACKUP="${BACKUP_DIR}/apt_mail_target.orig"
+readonly DEFAULT_SUBJECT_FILTER="unattended-upgrades"
 readonly TIMER_DAILY_DIR="/etc/systemd/system/apt-daily.timer.d"
 readonly TIMER_DAILY_CONF="/etc/systemd/system/apt-daily.timer.d/override.conf"
 readonly TIMER_UPGRADE_DIR="/etc/systemd/system/apt-daily-upgrade.timer.d"
@@ -66,6 +68,8 @@ SENDMAIL_LINKED=0
 INSTALL_MODE=""
 DETECTED_MTAS=""
 UPGRADE_MAIL_TARGET="root"
+PREVIOUS_UPGRADE_MAIL_TARGET=""
+ACTIVE_SUBJECT_FILTER=""
 E2E_STATUS="not run"
 
 declare -a CLEANUP_PATHS=()
@@ -1018,113 +1022,143 @@ strip_transport_map_value() {
     printf '%s' "$joined"
 }
 
-append_mail_recipient() {
-    local existing="${1:-}"
-    local recipient="$2"
-    local target_lower item trimmed item_lower found=0
-    local -a parts=()
-    local -a result=()
+save_previous_apt_mail_target() {
+    local current_target="${1:-}"
+    local orig_file="${2:-$APT_MAIL_ORIG_BACKUP}"
+    local backup_dir="${3:-$BACKUP_DIR}"
+    local trimmed lower_cur
 
-    target_lower="$(lowercase "$recipient")"
-    if [[ -z "${existing// /}" ]]; then
-        existing="root"
-    fi
+    trimmed="$(trim_ws "$current_target")"
+    lower_cur="$(lowercase "$trimmed")"
 
-    IFS=',' read -ra parts <<< "$existing"
-    for item in "${parts[@]}"; do
-        trimmed="$(trim_ws "$item")"
-        [[ -z "$trimmed" ]] && continue
-        result+=("$trimmed")
-        item_lower="$(lowercase "$trimmed")"
-        if [[ "$item_lower" == "$target_lower" ]]; then
-            found=1
-        fi
-    done
-
-    if [[ "$found" -eq 0 ]]; then
-        result+=("$recipient")
-    fi
-
-    local joined="" i
-    for i in "${!result[@]}"; do
-        if [[ "$i" -eq 0 ]]; then
-            joined="${result[$i]}"
-        else
-            joined="${joined}, ${result[$i]}"
-        fi
-    done
-    printf '%s' "$joined"
-}
-
-strip_mail_recipient() {
-    local existing="${1:-}"
-    local recipient="$2"
-    local target_lower item trimmed item_lower
-    local -a parts=()
-    local -a result=()
-
-    target_lower="$(lowercase "$recipient")"
-    IFS=',' read -ra parts <<< "$existing"
-    for item in "${parts[@]}"; do
-        trimmed="$(trim_ws "$item")"
-        [[ -z "$trimmed" ]] && continue
-        item_lower="$(lowercase "$trimmed")"
-        if [[ "$item_lower" == "$target_lower" ]]; then
-            continue
-        fi
-        result+=("$trimmed")
-    done
-
-    if [[ "${#result[@]}" -eq 0 ]]; then
-        printf '%s' "root"
+    if [[ -f "$orig_file" ]]; then
+        cat "$orig_file" 2>/dev/null || true
         return 0
     fi
 
-    local joined="" i
-    for i in "${!result[@]}"; do
-        if [[ "$i" -eq 0 ]]; then
-            joined="${result[$i]}"
-        else
-            joined="${joined}, ${result[$i]}"
-        fi
-    done
-    printf '%s' "$joined"
+    if [[ "$lower_cur" == "$(lowercase "$POSTFIX_RECIPIENT")" ]]; then
+        printf '%s' ""
+        return 0
+    fi
+
+    install -d -m 0750 -o root -g root "$backup_dir" 2>/dev/null || mkdir -p "$backup_dir"
+    printf '%s' "$trimmed" > "$orig_file"
+    chmod 0640 "$orig_file"
+    printf '%s' "$trimmed"
 }
 
-remove_apt_mail_recipient() {
+restore_apt_mail_target() {
     local apt_file="$1"
-    local recipient="$2"
+    local orig_file="${2:-$APT_MAIL_ORIG_BACKUP}"
     local backup_dir="${3:-$BACKUP_DIR}"
 
-    if [[ ! -f "$apt_file" ]] || ! grep -Fq "$recipient" "$apt_file" 2>/dev/null; then
+    if [[ ! -f "$apt_file" ]] || ! grep -Fq "$POSTFIX_RECIPIENT" "$apt_file" 2>/dev/null; then
         return 0
+    fi
+
+    local has_orig=0 orig_val=""
+    if [[ -f "$orig_file" ]]; then
+        has_orig=1
+        orig_val="$(cat "$orig_file" 2>/dev/null || true)"
+        orig_val="$(trim_ws "$orig_val")"
     fi
 
     local tmp_file
     tmp_file="$(mktemp "${apt_file}.tmp.XXXXXX")"
     register_cleanup_path "$tmp_file"
 
-    local line updated_val
+    local line
     while IFS= read -r line || [[ -n "$line" ]]; do
         if [[ "$line" =~ ^[[:space:]]*Unattended-Upgrade::Mail[[:space:]]+\"(.*)\"[[:space:]]*\;[[:space:]]*$ ]]; then
-            updated_val="$(strip_mail_recipient "${BASH_REMATCH[1]}" "$recipient")"
-            printf 'Unattended-Upgrade::Mail "%s";\n' "$updated_val" >> "$tmp_file"
+            if [[ -n "$orig_val" ]]; then
+                printf 'Unattended-Upgrade::Mail "%s";\n' "$orig_val" >> "$tmp_file"
+            else
+                printf '// Unattended-Upgrade::Mail ""; // Restored by mail2hook uninstall\n' >> "$tmp_file"
+            fi
         else
             printf '%s\n' "$line" >> "$tmp_file"
         fi
     done < "$apt_file"
 
-    if cmp -s "$apt_file" "$tmp_file"; then
+    if ! cmp -s "$apt_file" "$tmp_file"; then
+        if [[ -n "$backup_dir" ]]; then
+            backup_file_to_dir "$apt_file" "$backup_dir"
+        fi
+        chmod 0644 "$tmp_file"
+        mv -f "$tmp_file" "$apt_file"
+        if [[ -n "$orig_val" ]]; then
+            record_change "Restored Unattended-Upgrade::Mail to \"${orig_val}\" in $apt_file"
+        else
+            record_change "Restored Unattended-Upgrade::Mail to unset in $apt_file"
+        fi
+    else
         rm -f "$tmp_file"
+    fi
+
+    if [[ "$has_orig" -eq 1 ]]; then
+        rm -f "$orig_file"
+    fi
+}
+
+ensure_env_filter_default() {
+    local env_path="$1"
+    local default_keywords="${2:-$DEFAULT_SUBJECT_FILTER}"
+
+    if [[ ! -f "$env_path" ]]; then
         return 0
     fi
 
-    if [[ -n "$backup_dir" ]]; then
-        backup_file_to_dir "$apt_file" "$backup_dir"
+    if grep -Eq '^[[:space:]]*(export[[:space:]]+)?FILTER_SUBJECT_KEYWORDS[[:space:]]*=' "$env_path" 2>/dev/null; then
+        return 0
     fi
-    chmod 0644 "$tmp_file"
-    mv -f "$tmp_file" "$apt_file"
-    record_change "Removed $recipient from Unattended-Upgrade::Mail in $apt_file"
+
+    local tmp_filter
+    tmp_filter="$(mktemp "${env_path}.tmp.XXXXXX")"
+    register_cleanup_path "$tmp_filter"
+
+    local line inserted=0
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        if [[ "$inserted" -eq 0 && "$line" =~ ^[[:space:]]*#[[:space:]]*FILTER_SUBJECT_KEYWORDS[[:space:]]*= ]]; then
+            printf 'FILTER_SUBJECT_KEYWORDS=%s\n' "$default_keywords" >> "$tmp_filter"
+            inserted=1
+        else
+            printf '%s\n' "$line" >> "$tmp_filter"
+        fi
+    done < "$env_path"
+
+    if [[ "$inserted" -eq 0 ]]; then
+        printf '\n# Restrict Discord alerts to unattended-upgrades mail by default\n' >> "$tmp_filter"
+        printf 'FILTER_SUBJECT_KEYWORDS=%s\n' "$default_keywords" >> "$tmp_filter"
+    fi
+
+    mv -f "$tmp_filter" "$env_path"
+}
+
+read_env_var() {
+    local env_path="$1"
+    local var_name="$2"
+
+    if [[ ! -f "$env_path" ]]; then
+        return 0
+    fi
+
+    local line val found_val=""
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        if [[ "$line" =~ ^[[:space:]]*(export[[:space:]]+)?${var_name}[[:space:]]*=(.*)$ ]]; then
+            val="$(trim_ws "${BASH_REMATCH[2]}")"
+            if [[ "$val" =~ ^\"(.*)\"[[:space:]]*(#.*)?$ ]]; then
+                val="${BASH_REMATCH[1]}"
+            elif [[ "$val" =~ ^\'(.*)\'[[:space:]]*(#.*)?$ ]]; then
+                val="${BASH_REMATCH[1]}"
+            else
+                val="${val%% #*}"
+                val="$(trim_ws "$val")"
+            fi
+            found_val="$val"
+        fi
+    done < "$env_path"
+
+    printf '%s' "$found_val"
 }
 
 reload_postfix() {
@@ -1269,6 +1303,8 @@ write_env_file() {
         if [[ "$updated" -eq 0 ]]; then
             printf '\nDISCORD_WEBHOOK_URL=%s\n' "$RESOLVED_WEBHOOK_URL" >> "$tmp_env"
         fi
+
+        ensure_env_filter_default "$tmp_env" "$DEFAULT_SUBJECT_FILTER"
     else
         cat > "$tmp_env" <<EOF
 # /etc/mail2hook/env - Configuration for mail2hook
@@ -1285,8 +1321,10 @@ DISCORD_WEBHOOK_URL=${RESOLVED_WEBHOOK_URL}
 # Optional: Comma-separated sender addresses, domains, or usernames to match. If unset, all senders match.
 # FILTER_SENDERS=
 
-# Optional: Comma-separated subject keywords to match (case-insensitive). If unset, all subjects match.
-# FILTER_SUBJECT_KEYWORDS=
+# Comma-separated subject keywords to match (case-insensitive).
+# Defaults to unattended-upgrades so cron/other local mail is dropped silently (exit 0).
+# Set empty (FILTER_SUBJECT_KEYWORDS=) to forward all mail subjects.
+FILTER_SUBJECT_KEYWORDS=${DEFAULT_SUBJECT_FILTER}
 
 # Optional: Maximum body characters to include in the Discord embed excerpt (default: 1500)
 # MAX_BODY_CHARS=1500
@@ -1299,7 +1337,8 @@ EOF
     chown "root:${ENV_GROUP}" "$tmp_env"
     chmod 0640 "$tmp_env"
     mv -f "$tmp_env" "$ENV_FILE"
-    record_change "Configured $ENV_FILE (root:${ENV_GROUP}, mode 0640)"
+    ACTIVE_SUBJECT_FILTER="$(read_env_var "$ENV_FILE" "FILTER_SUBJECT_KEYWORDS")"
+    record_change "Configured $ENV_FILE (root:${ENV_GROUP}, mode 0640; FILTER_SUBJECT_KEYWORDS=${ACTIVE_SUBJECT_FILTER:-<all>})"
     log_info "Secured configuration file at $ENV_FILE (root:${ENV_GROUP}, mode 0640)"
 }
 
@@ -1335,7 +1374,8 @@ configure_unattended_upgrades() {
     local existing_mail=""
     existing_mail="$(read_apt_mail_target)"
     if [[ "$INSTALL_MODE" == "postfix-pipe" ]]; then
-        UPGRADE_MAIL_TARGET="$(append_mail_recipient "$existing_mail" "$POSTFIX_RECIPIENT")"
+        PREVIOUS_UPGRADE_MAIL_TARGET="$(save_previous_apt_mail_target "$existing_mail" "$APT_MAIL_ORIG_BACKUP" "$BACKUP_DIR")"
+        UPGRADE_MAIL_TARGET="$POSTFIX_RECIPIENT"
     else
         UPGRADE_MAIL_TARGET="root"
     fi
@@ -1572,10 +1612,18 @@ print_summary() {
             "$POSTFIX_RECIPIENT" "$POSTFIX_TRANSPORT_NAME" "$POSTFIX_PIPE_USER" "$ENV_GROUP"
     fi
     printf '  Config File      : %s (root:%s, 0640)\n' "$ENV_FILE" "$ENV_GROUP"
+    printf '  Subject Filter   : %s\n' "${ACTIVE_SUBJECT_FILTER:-<all subjects>}"
     printf '  End-to-End Test  : %s\n' "$E2E_STATUS"
     if [[ "$FLAG_SKIP_UPGRADES" -eq 0 ]]; then
         printf '  Auto-Upgrades    : Security updates only (Automatic-Reboot: false)\n'
-        printf '  Upgrade Mail To  : %s\n' "$UPGRADE_MAIL_TARGET"
+        if [[ "$INSTALL_MODE" == "postfix-pipe" ]]; then
+            printf '  Upgrade Mail To  : %s (replaced previous value: %s)\n' \
+                "$UPGRADE_MAIL_TARGET" "${PREVIOUS_UPGRADE_MAIL_TARGET:-<unset>}"
+            printf '  Root Mail Policy : Other root/admin mail untouched (only %s enters pipe)\n' \
+                "$POSTFIX_RECIPIENT"
+        else
+            printf '  Upgrade Mail To  : %s\n' "$UPGRADE_MAIL_TARGET"
+        fi
         printf '  Download Window  : 01:00 - 02:00 local time (%s)\n' "$tz_info"
         printf '  Upgrade Window   : 03:00 - 04:00 local time (%s)\n' "$tz_info"
     else
@@ -1604,11 +1652,11 @@ print_summary() {
     printf '\nUseful Commands:\n'
     printf '  Upgrade logs     : sudo tail -n 50 /var/log/unattended-upgrades/unattended-upgrades.log\n'
     if [[ "$INSTALL_MODE" == "postfix-pipe" ]]; then
-        printf '  Test Postfix     : printf "To: %s\\nFrom: root\\nSubject: test\\n\\nHello\\n" | sudo sendmail -oi -t\n' "$POSTFIX_RECIPIENT"
+        printf '  Test Postfix     : printf "To: %s\\nFrom: root\\nSubject: unattended-upgrades test\\n\\nHello\\n" | sudo sendmail -oi -t\n' "$POSTFIX_RECIPIENT"
     else
-        printf '  Test sendmail    : printf "To: root\\nFrom: root\\nSubject: test\\n\\nHello\\n" | sudo sendmail -oi -t\n'
+        printf '  Test sendmail    : printf "To: root\\nFrom: root\\nSubject: unattended-upgrades test\\n\\nHello\\n" | sudo sendmail -oi -t\n'
     fi
-    printf '  Test dry-run     : printf "Subject: Test\\nFrom: root\\n\\nHello\\n" | sudo mail2hook --dry-run\n'
+    printf '  Test dry-run     : printf "Subject: unattended-upgrades test\\nFrom: root\\n\\nHello\\n" | sudo mail2hook --dry-run\n'
     printf '============================================================\n'
 
     if [[ -f /var/run/reboot-required || -f /run/reboot-required ]]; then
@@ -1715,7 +1763,7 @@ run_uninstall() {
 
     if [[ "$FLAG_PURGE_UPGRADES" -eq 1 ]]; then
         log_info "Purging unattended-upgrades drop-ins and timer overrides (--purge-upgrades)..."
-        rm -f "$APT_LOCAL_UPGRADES" "$APT_AUTO_UPGRADES" "$APT_LEGACY_MAIL2HOOK"
+        rm -f "$APT_LOCAL_UPGRADES" "$APT_AUTO_UPGRADES" "$APT_LEGACY_MAIL2HOOK" "$APT_MAIL_ORIG_BACKUP"
         rm -f "$TIMER_DAILY_CONF" "$TIMER_UPGRADE_CONF"
         rmdir --ignore-fail-on-non-empty "$TIMER_DAILY_DIR" "$TIMER_UPGRADE_DIR" 2>/dev/null || true
         if is_systemd_running; then
@@ -1725,7 +1773,7 @@ run_uninstall() {
         record_change "Purged unattended-upgrades drop-ins and timer overrides"
         log_info "Removed unattended-upgrades local drop-ins and timer overrides."
     else
-        remove_apt_mail_recipient "$APT_LOCAL_UPGRADES" "$POSTFIX_RECIPIENT" "$BACKUP_DIR"
+        restore_apt_mail_target "$APT_LOCAL_UPGRADES" "$APT_MAIL_ORIG_BACKUP" "$BACKUP_DIR"
         log_info "Left unattended-upgrades configuration in place (pass --purge-upgrades to remove)."
     fi
 

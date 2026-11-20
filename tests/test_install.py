@@ -143,46 +143,95 @@ def test_transport_map_value_helpers(tmp_path: Path) -> None:
     ]
 
 
-def test_append_and_strip_mail_recipient(tmp_path: Path) -> None:
+def test_save_and_restore_apt_mail_target(tmp_path: Path) -> None:
     apt_file = tmp_path / "52-unattended-upgrades-local"
     backup_dir = tmp_path / "backups"
+    orig_file = backup_dir / "apt_mail_target.orig"
+
+    # 1. Save previous value (e.g. admin@example.com); keep original if mail2hook@localhost
+    res1 = _run_install_fn(
+        f'prev1="$(save_previous_apt_mail_target "admin@example.com" '
+        f'"{orig_file}" "{backup_dir}")"\n'
+        f'prev2="$(save_previous_apt_mail_target "mail2hook@localhost" '
+        f'"{orig_file}" "{backup_dir}")"\n'
+        'echo "prev1=$prev1"\n'
+        'echo "prev2=$prev2"\n'
+    )
+    assert res1.returncode == 0, res1.stderr
+    assert res1.stdout.splitlines() == ["prev1=admin@example.com", "prev2=admin@example.com"]
+    assert orig_file.read_text(encoding="utf-8") == "admin@example.com"
+
+    # 2. Restore restores previous non-empty target and removes orig_file
     apt_file.write_text(
-        'Unattended-Upgrade::Mail "root, mail2hook@localhost";\n'
+        'Unattended-Upgrade::Mail "mail2hook@localhost";\n'
         'Unattended-Upgrade::MailReport "on-change";\n',
         encoding="utf-8",
     )
-
-    res = _run_install_fn(
-        "\n".join(
-            [
-                'echo "a=$(append_mail_recipient "" "mail2hook@localhost")"',
-                'echo "b=$(append_mail_recipient "root" "mail2hook@localhost")"',
-                'echo "c=$(append_mail_recipient "admin@example.com" "mail2hook@localhost")"',
-                (
-                    'echo "d=$(append_mail_recipient "root, mail2hook@localhost" '
-                    '"mail2hook@localhost")"'
-                ),
-                (
-                    'echo "e=$(strip_mail_recipient "root, mail2hook@localhost" '
-                    '"mail2hook@localhost")"'
-                ),
-                'echo "f=$(strip_mail_recipient "mail2hook@localhost" "mail2hook@localhost")"',
-                f'remove_apt_mail_recipient "{apt_file}" "mail2hook@localhost" "{backup_dir}"',
-            ]
-        )
-    )
-    assert res.returncode == 0, res.stderr
-    lines = res.stdout.splitlines()
-    assert lines[:6] == [
-        "a=root, mail2hook@localhost",
-        "b=root, mail2hook@localhost",
-        "c=admin@example.com, mail2hook@localhost",
-        "d=root, mail2hook@localhost",
-        "e=root",
-        "f=root",
-    ]
-    assert 'Unattended-Upgrade::Mail "root";' in apt_file.read_text(encoding="utf-8")
+    res2 = _run_install_fn(f'restore_apt_mail_target "{apt_file}" "{orig_file}" "{backup_dir}"')
+    assert res2.returncode == 0, res2.stderr
+    assert 'Unattended-Upgrade::Mail "admin@example.com";' in apt_file.read_text(encoding="utf-8")
+    assert not orig_file.exists()
     assert len(list(backup_dir.glob("*.bak"))) == 1
+
+    # 3. Previously unset (empty) target restores to commented-out state
+    res3 = _run_install_fn(
+        f'prev_empty="$(save_previous_apt_mail_target "" "{orig_file}" "{backup_dir}")"\n'
+        'echo "prev_empty=$prev_empty"\n'
+    )
+    assert res3.returncode == 0, res3.stderr
+    assert res3.stdout.strip() == "prev_empty="
+    apt_file.write_text(
+        'Unattended-Upgrade::Mail "mail2hook@localhost";\n',
+        encoding="utf-8",
+    )
+    res4 = _run_install_fn(f'restore_apt_mail_target "{apt_file}" "{orig_file}" "{backup_dir}"')
+    assert res4.returncode == 0, res4.stderr
+    restored_text = apt_file.read_text(encoding="utf-8")
+    assert '// Unattended-Upgrade::Mail "";' in restored_text
+    assert not orig_file.exists()
+
+
+def test_ensure_env_filter_default(tmp_path: Path) -> None:
+    # Case 1: commented placeholder becomes uncommented default
+    env1 = tmp_path / "env1"
+    env1.write_text(
+        "DISCORD_WEBHOOK_URL=https://discord.com/api/webhooks/1/tok\n# FILTER_SUBJECT_KEYWORDS=\n",
+        encoding="utf-8",
+    )
+    res1 = _run_install_fn(f'ensure_env_filter_default "{env1}" "unattended-upgrades"')
+    assert res1.returncode == 0, res1.stderr
+    assert "\nFILTER_SUBJECT_KEYWORDS=unattended-upgrades\n" in env1.read_text(encoding="utf-8")
+
+    # Case 2: missing line gets appended
+    env2 = tmp_path / "env2"
+    env2.write_text(
+        "DISCORD_WEBHOOK_URL=https://discord.com/api/webhooks/1/tok\n",
+        encoding="utf-8",
+    )
+    res2 = _run_install_fn(f'ensure_env_filter_default "{env2}" "unattended-upgrades"')
+    assert res2.returncode == 0, res2.stderr
+    assert "FILTER_SUBJECT_KEYWORDS=unattended-upgrades\n" in env2.read_text(encoding="utf-8")
+
+    # Case 3: explicit custom filter is preserved
+    env3 = tmp_path / "env3"
+    original3 = (
+        "DISCORD_WEBHOOK_URL=https://discord.com/api/webhooks/1/tok\n"
+        "FILTER_SUBJECT_KEYWORDS=security,kernel\n"
+    )
+    env3.write_text(original3, encoding="utf-8")
+    res3 = _run_install_fn(f'ensure_env_filter_default "{env3}" "unattended-upgrades"')
+    assert res3.returncode == 0, res3.stderr
+    assert env3.read_text(encoding="utf-8") == original3
+
+    # Case 4: explicit empty override (allow all) is preserved
+    env4 = tmp_path / "env4"
+    original4 = (
+        "DISCORD_WEBHOOK_URL=https://discord.com/api/webhooks/1/tok\nFILTER_SUBJECT_KEYWORDS=\n"
+    )
+    env4.write_text(original4, encoding="utf-8")
+    res4 = _run_install_fn(f'ensure_env_filter_default "{env4}" "unattended-upgrades"')
+    assert res4.returncode == 0, res4.stderr
+    assert env4.read_text(encoding="utf-8") == original4
 
 
 def test_backup_file_to_dir_keeps_apt_conf_d_clean(tmp_path: Path) -> None:
