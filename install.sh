@@ -42,6 +42,8 @@ readonly APT_LOCAL_UPGRADES="/etc/apt/apt.conf.d/52-unattended-upgrades-local"
 readonly APT_LEGACY_MAIL2HOOK="/etc/apt/apt.conf.d/52mail2hook"
 readonly APT_MAIL_ORIG_BACKUP="${BACKUP_DIR}/apt_mail_target.orig"
 readonly DEFAULT_SUBJECT_FILTER="unattended-upgrades"
+readonly E2E_MARKER_DIR="/run/mail2hook"
+readonly E2E_MARKER_FILE="/run/mail2hook/e2e-confirm"
 readonly TIMER_DAILY_DIR="/etc/systemd/system/apt-daily.timer.d"
 readonly TIMER_DAILY_CONF="/etc/systemd/system/apt-daily.timer.d/override.conf"
 readonly TIMER_UPGRADE_DIR="/etc/systemd/system/apt-daily-upgrade.timer.d"
@@ -71,6 +73,8 @@ UPGRADE_MAIL_TARGET="root"
 PREVIOUS_UPGRADE_MAIL_TARGET=""
 ACTIVE_SUBJECT_FILTER=""
 E2E_STATUS="not run"
+E2E_FAILED=0
+E2E_FAILURE_REASON=""
 
 declare -a CLEANUP_PATHS=()
 declare -a CHANGES_MADE=()
@@ -1520,50 +1524,112 @@ verify_unattended_upgrades() {
     fi
 }
 
+wait_for_e2e_marker() {
+    local marker_file="$1"
+    local test_id="$2"
+    local timeout_secs="${3:-15}"
+    local poll_interval="${4:-0.5}"
+
+    local max_polls
+    max_polls="$(awk -v t="$timeout_secs" -v p="$poll_interval" 'BEGIN { n = int(t / p + 0.5); if (n < 1) n = 1; print n }')"
+
+    local i=0 line status
+    while [[ "$i" -lt "$max_polls" ]]; do
+        if [[ -f "$marker_file" ]]; then
+            line="$(tr -d '\r' < "$marker_file" 2>/dev/null | head -n 1 || true)"
+            if [[ -n "$line" && "$line" == *":${test_id}" ]]; then
+                status="${line%":${test_id}"}"
+                printf '%s' "$status"
+                case "$status" in
+                    ok) return 0 ;;
+                    filtered) return 2 ;;
+                    *) return 3 ;;
+                esac
+            fi
+        fi
+        i=$((i + 1))
+        if [[ "$i" -lt "$max_polls" ]]; then
+            sleep "$poll_interval"
+        fi
+    done
+
+    printf '%s' "timeout"
+    return 1
+}
+
 run_sendmail_e2e_test() {
     local host_name
     host_name="$(hostname 2>/dev/null || echo 'server')"
+    E2E_FAILED=0
+    E2E_FAILURE_REASON=""
 
-    if [[ "$INSTALL_MODE" == "postfix-pipe" ]]; then
-        log_info "Submitting test message through $SENDMAIL_PATH -> $POSTFIX_RECIPIENT..."
-        local rc=0
-        if printf 'To: %s\nFrom: root\nSubject: mail2hook Postfix route test on %s\n\nmail2hook Postfix pipe test submitted via %s.\n' \
-            "$POSTFIX_RECIPIENT" "$host_name" "$SENDMAIL_PATH" \
-            | "$SENDMAIL_PATH" -oi -t; then
-            E2E_STATUS="submitted (via $SENDMAIL_PATH -> $POSTFIX_RECIPIENT)"
-            log_info "Submitted test message through Postfix ($POSTFIX_RECIPIENT)."
+    if [[ "$INSTALL_MODE" == "postfix-pipe" || "$SENDMAIL_LINKED" -eq 1 ]]; then
+        local test_id recipient route_label
+        test_id="$(python3 -c 'import secrets; print(secrets.token_hex(16))')"
+        if [[ "$INSTALL_MODE" == "postfix-pipe" ]]; then
+            recipient="$POSTFIX_RECIPIENT"
+            route_label="Postfix pipe ($POSTFIX_RECIPIENT)"
         else
-            rc=$?
-            E2E_STATUS="failed (exit code ${rc})"
-            log_warn "Postfix sendmail test submission failed with exit code ${rc}."
+            recipient="root"
+            route_label="sendmail shim"
         fi
-    elif [[ "$SENDMAIL_LINKED" -eq 1 ]]; then
-        log_info "Sending end-to-end test message through $SENDMAIL_PATH..."
-        local rc=0
-        if printf 'To: root\nFrom: root\nSubject: mail2hook install test on %s\n\nmail2hook sendmail shim verification succeeded.\n' "$host_name" \
+
+        install -d -m 0770 -o root -g "$ENV_GROUP" "$E2E_MARKER_DIR"
+        register_cleanup_path "$E2E_MARKER_DIR"
+        install -m 0660 -o root -g "$ENV_GROUP" /dev/null "$E2E_MARKER_FILE"
+
+        log_info "Submitting real-path E2E test through $SENDMAIL_PATH ($route_label)..."
+        local send_rc=0
+        if printf 'To: %s\nFrom: root\nSubject: unattended-upgrades install test for %s\nX-Mail2Hook-Test-Id: %s\n\nmail2hook end-to-end delivery check via %s (%s).\n' \
+            "$recipient" "$host_name" "$test_id" "$SENDMAIL_PATH" "$route_label" \
             | "$SENDMAIL_PATH" -oi -t; then
-            E2E_STATUS="passed (via $SENDMAIL_PATH)"
-            log_info "End-to-end sendmail test succeeded."
+            local marker_status="" marker_rc=0
+            marker_status="$(wait_for_e2e_marker "$E2E_MARKER_FILE" "$test_id" 15 0.5)" || marker_rc=$?
+
+            case "$marker_rc" in
+                0)
+                    E2E_FAILED=0
+                    E2E_STATUS="confirmed (delivered via $SENDMAIL_PATH -> $BIN_PATH -> Discord)"
+                    log_info "End-to-end test confirmed through $SENDMAIL_PATH ($route_label)."
+                    ;;
+                2)
+                    E2E_FAILED=1
+                    E2E_STATUS="FAILED (reached mail2hook via $SENDMAIL_PATH, but dropped by filter)"
+                    E2E_FAILURE_REASON="The test reached $BIN_PATH via $SENDMAIL_PATH, but was dropped by FILTER_SENDERS or FILTER_SUBJECT_KEYWORDS in $ENV_FILE."
+                    log_error "$E2E_FAILURE_REASON"
+                    ;;
+                3)
+                    local fail_code="${marker_status#failed:}"
+                    E2E_FAILED=1
+                    E2E_STATUS="FAILED (mail2hook exited ${fail_code} via $SENDMAIL_PATH)"
+                    E2E_FAILURE_REASON="The test reached $BIN_PATH via $SENDMAIL_PATH, but mail2hook exited with code ${fail_code}."
+                    log_error "$E2E_FAILURE_REASON"
+                    ;;
+                *)
+                    E2E_FAILED=1
+                    E2E_STATUS="FAILED (timed out waiting for mail2hook confirmation via $SENDMAIL_PATH)"
+                    E2E_FAILURE_REASON="Submitted test message via $SENDMAIL_PATH ($route_label), but mail2hook did not report delivery within 15s."
+                    log_error "$E2E_FAILURE_REASON"
+                    ;;
+            esac
         else
-            rc=$?
-            E2E_STATUS="failed (exit code ${rc})"
-            log_warn "End-to-end sendmail test failed with exit code ${rc}."
-            log_warn "Verify network access and the webhook URL in $ENV_FILE, then re-test with:"
-            log_warn "  printf 'Subject: test\\nFrom: root\\nTo: root\\n\\nTest message.\\n' | sudo $SENDMAIL_PATH -oi -t"
+            send_rc=$?
+            E2E_FAILED=1
+            E2E_STATUS="FAILED ($SENDMAIL_PATH exited ${send_rc})"
+            E2E_FAILURE_REASON="$SENDMAIL_PATH exited with code ${send_rc} before queuing/delivering the test message."
+            log_error "$E2E_FAILURE_REASON"
         fi
+
+        rm -rf "$E2E_MARKER_DIR"
     else
-        log_warn "Skipping $SENDMAIL_PATH end-to-end test because another MTA owns $SENDMAIL_PATH."
-        log_info "Testing $BIN_PATH directly instead..."
-        local rc=0
-        if printf 'To: root\nFrom: root\nSubject: mail2hook install test on %s\n\nmail2hook direct invocation verification (sendmail NOT linked to mail2hook).\n' "$host_name" \
-            | "$BIN_PATH" -oi -t; then
-            E2E_STATUS="direct only (sendmail NOT linked — existing MTA active)"
-            log_warn "Direct $BIN_PATH test succeeded, but $SENDMAIL_PATH is still owned by another MTA."
-        else
-            rc=$?
-            E2E_STATUS="failed (direct $BIN_PATH exit code ${rc})"
-            log_warn "Direct $BIN_PATH test failed with exit code ${rc}."
-        fi
+        E2E_FAILED=1
+        E2E_STATUS="FAILED — not linked ($SENDMAIL_PATH owned by ${DETECTED_MTAS:-existing MTA})"
+        E2E_FAILURE_REASON="$SENDMAIL_PATH is still owned by ${DETECTED_MTAS:-another MTA} and is NOT linked to mail2hook."
+        log_error "$E2E_FAILURE_REASON"
+        log_warn "Posting an unlinked-warning notice directly via $BIN_PATH (installer will still exit non-zero)..."
+        printf 'To: root\nFrom: root\nSubject: unattended-upgrades install notice for %s: NOT LINKED\n\nWARNING: mail2hook is NOT linked to %s (%s owns it).\nReal unattended-upgrades mail will NOT reach Discord until you configure your MTA or purge it and re-run install.sh.\n' \
+            "$host_name" "$SENDMAIL_PATH" "${DETECTED_MTAS:-another MTA}" \
+            | "$BIN_PATH" -oi -t || true
     fi
 }
 
@@ -1643,11 +1709,29 @@ print_summary() {
             printf '  - %s\n' "$bak"
         done
     fi
-    if [[ "$INSTALL_MODE" == "manual-mta" ]]; then
-        printf '\n[ACTION REQUIRED] Existing MTA (%s) still owns %s.\n' \
-            "${DETECTED_MTAS:-unknown}" "$SENDMAIL_PATH"
-        printf 'System mail will NOT reach mail2hook until you configure your MTA to route to %s\n' "$BIN_PATH"
-        printf 'or purge the conflicting MTA and re-run install.sh.\n'
+    if [[ "$E2E_FAILED" -ne 0 ]]; then
+        printf '\n[ACTION REQUIRED] End-to-end delivery could NOT be confirmed!\n'
+        printf '  Reason: %s\n' "${E2E_FAILURE_REASON:-Unknown delivery failure}"
+        if [[ "$INSTALL_MODE" == "manual-mta" ]]; then
+            printf '  Remediation:\n'
+            printf '    1. Remove the conflicting MTA (%s) and re-run install.sh, OR\n' \
+                "${DETECTED_MTAS:-unknown}"
+            printf "    2. Configure your MTA to pipe %s to %s -oi -f \${sender} -- \${recipient}\n" \
+                "$POSTFIX_RECIPIENT" "$BIN_PATH"
+        elif [[ "$INSTALL_MODE" == "postfix-pipe" ]]; then
+            printf '  Remediation checks:\n'
+            printf '    sudo postqueue -p\n'
+            printf '    sudo journalctl -u postfix -n 50 --no-pager\n'
+            printf '    sudo postmap -q %s %s\n' "$POSTFIX_RECIPIENT" "$POSTFIX_TRANSPORT_FILE"
+            printf '    ls -ld %s %s\n' "$CONFIG_DIR" "$ENV_FILE"
+            printf '    printf "Subject: unattended-upgrades test\\n\\nHi\\n" | sudo -u %s %s --dry-run\n' \
+                "$POSTFIX_PIPE_USER" "$BIN_PATH"
+        else
+            printf '  Remediation checks:\n'
+            printf '    readlink -f %s\n' "$SENDMAIL_PATH"
+            printf '    printf "To: root\\nFrom: root\\nSubject: unattended-upgrades test\\n\\nHi\\n" | sudo %s -oi -t\n' \
+                "$SENDMAIL_PATH"
+        fi
     fi
     printf '\nUseful Commands:\n'
     printf '  Upgrade logs     : sudo tail -n 50 /var/log/unattended-upgrades/unattended-upgrades.log\n'
@@ -1815,6 +1899,11 @@ main() {
     configure_unattended_upgrades
     run_sendmail_e2e_test
     print_summary
+
+    if [[ "$E2E_FAILED" -ne 0 ]]; then
+        log_error "Installation finished, but end-to-end verification failed. Resolve [ACTION REQUIRED] above."
+        exit 1
+    fi
 }
 
 if [[ -z "${BASH_SOURCE[0]:-}" || "${BASH_SOURCE[0]}" == "${0}" ]]; then

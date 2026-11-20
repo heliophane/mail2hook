@@ -249,3 +249,53 @@ def test_backup_file_to_dir_keeps_apt_conf_d_clean(tmp_path: Path) -> None:
     backups = list(backup_dir.glob("*.bak"))
     assert len(backups) == 1
     assert backups[0].name.endswith(".bak")
+
+
+def test_wait_for_e2e_marker_statuses(tmp_path: Path) -> None:
+    token = "0123456789abcdef0123456789abcdef"
+    marker = tmp_path / "e2e-confirm"
+
+    # 1. Immediate ok marker
+    marker.write_text(f"ok:{token}\n", encoding="utf-8")
+    res_ok = _run_install_fn(f'wait_for_e2e_marker "{marker}" "{token}" 1 0.05')
+    assert res_ok.returncode == 0
+    assert res_ok.stdout == "ok"
+
+    # 2. Delayed async write simulating Postfix pipe delivery
+    marker.write_text("", encoding="utf-8")
+    res_async = _run_install_fn(
+        f'(sleep 0.15 && printf "ok:{token}\\n" > "{marker}") &\n'
+        f'wait_for_e2e_marker "{marker}" "{token}" 2 0.05\n'
+        "rc=$?\n"
+        "wait\n"
+        "exit $rc\n"
+    )
+    assert res_async.returncode == 0
+    assert res_async.stdout == "ok"
+
+    # 3. Filtered marker returns exit 2
+    marker.write_text(f"filtered:{token}\n", encoding="utf-8")
+    res_filtered = _run_install_fn(f'wait_for_e2e_marker "{marker}" "{token}" 1 0.05')
+    assert res_filtered.returncode == 2
+    assert res_filtered.stdout == "filtered"
+
+    # 4. Failed marker returns exit 3 and preserves status code
+    marker.write_text(f"failed:78:{token}\n", encoding="utf-8")
+    res_failed = _run_install_fn(f'wait_for_e2e_marker "{marker}" "{token}" 1 0.05')
+    assert res_failed.returncode == 3
+    assert res_failed.stdout == "failed:78"
+
+    # 5. Mismatched token times out cleanly with exit 1
+    marker.write_text("ok:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n", encoding="utf-8")
+    res_timeout = _run_install_fn(f'wait_for_e2e_marker "{marker}" "{token}" 1 0.1')
+    assert res_timeout.returncode == 1
+    assert res_timeout.stdout == "timeout"
+
+
+def test_e2e_unlinked_mta_fails_loudly_and_exits_nonzero() -> None:
+    content = INSTALL_SH.read_text(encoding="utf-8")
+    assert "NOT LINKED" in content
+    assert "[ACTION REQUIRED]" in content
+    assert 'if [[ "$E2E_FAILED" -ne 0 ]]; then' in content
+    # Ensure direct fallback never reports "passed"
+    assert "passed (direct" not in content
