@@ -2,15 +2,20 @@
 
 from __future__ import annotations
 
+import http.client
 import json
 import logging
+import math
 import platform
+import random
 import re
 import socket
 import time
 import urllib.error
 import urllib.request
-from email.utils import parseaddr
+from collections.abc import Mapping
+from datetime import UTC
+from email.utils import parseaddr, parsedate_to_datetime
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
@@ -66,10 +71,22 @@ _URL_USERINFO_RE = re.compile(r"(https?://)([^/\s@]+)@")
 
 
 def redact_webhook_url(url: str) -> str:
-    """Mask the secret token part of a Discord webhook URL for safe logging."""
-    parts = url.rstrip("/").split("/")
-    if len(parts) >= 2 and parts[-2].isdigit():
-        return f"{'/'.join(parts[:-1])}/[REDACTED]"
+    """Mask the secret token part and any credentials of a Discord webhook URL."""
+    try:
+        parsed = urlsplit(url.strip())
+    except ValueError:
+        return "[REDACTED_WEBHOOK_URL]"
+
+    if not parsed.scheme or not parsed.netloc:
+        return "[REDACTED_WEBHOOK_URL]"
+
+    host_part = parsed.netloc.rsplit("@", 1)[-1]
+    prefix = f"{parsed.scheme}://[REDACTED]@" if "@" in parsed.netloc else f"{parsed.scheme}://"
+
+    path_parts = [p for p in parsed.path.split("/") if p]
+    if len(path_parts) >= 2 and path_parts[-2].isdigit():
+        redacted_path = "/" + "/".join([*path_parts[:-1], "[REDACTED]"])
+        return f"{prefix}{host_part}{redacted_path}"
     return "[REDACTED_WEBHOOK_URL]"
 
 
@@ -366,100 +383,246 @@ def build_payload(msg: ParsedMessage, config: Config) -> dict[str, Any]:
     }
 
 
+MAX_ERROR_BODY_BYTES = 4096
+DEFAULT_TOTAL_TIMEOUT = 60.0
+
+
+class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Reject HTTP 3xx redirects rather than converting POST into GET."""
+
+    def redirect_request(
+        self,
+        req: urllib.request.Request,
+        fp: Any,
+        code: int,
+        msg: str,
+        headers: Any,
+        newurl: str,
+    ) -> urllib.request.Request | None:
+        return None
+
+
+_NO_REDIRECT_OPENER = urllib.request.build_opener(_NoRedirectHandler())
+
+
+def _open_request(req: urllib.request.Request, timeout: float = 15.0) -> Any:
+    """Execute an HTTP request without following redirects."""
+    return _NO_REDIRECT_OPENER.open(req, timeout=timeout)
+
+
+def _header_get(headers: Mapping[str, str] | None, name: str) -> str | None:
+    """Lookup an HTTP header value case-insensitively."""
+    if headers is None:
+        return None
+    val = headers.get(name)
+    if val is not None:
+        return val
+    target = name.lower()
+    for key in headers:
+        if str(key).lower() == target:
+            return headers[key]
+    return None
+
+
+def _parse_non_negative_finite(raw: Any) -> float | None:
+    """Parse raw numeric value as a finite float >= 0, else return None."""
+    if isinstance(raw, bool):
+        return None
+    try:
+        val = float(raw)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(val) or val < 0:
+        return None
+    return val
+
+
+def _parse_retry_after(
+    headers: Mapping[str, str] | None,
+    body_bytes: bytes,
+    *,
+    default: float = 2.0,
+) -> float:
+    """Determine wait seconds from JSON retry_after, X-RateLimit-Reset-After, or Retry-After."""
+    if body_bytes:
+        try:
+            body_data = json.loads(body_bytes.decode("utf-8", errors="replace"))
+            if isinstance(body_data, dict) and "retry_after" in body_data:
+                parsed = _parse_non_negative_finite(body_data["retry_after"])
+                if parsed is not None:
+                    return parsed
+        except Exception:
+            pass
+
+    reset_after = _header_get(headers, "X-RateLimit-Reset-After")
+    if reset_after is not None:
+        parsed = _parse_non_negative_finite(reset_after.strip())
+        if parsed is not None:
+            return parsed
+
+    retry_header = _header_get(headers, "Retry-After")
+    if retry_header is not None:
+        stripped = retry_header.strip()
+        parsed = _parse_non_negative_finite(stripped)
+        if parsed is not None:
+            return parsed
+        try:
+            dt = parsedate_to_datetime(stripped)
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=UTC)
+            delta = dt.timestamp() - time.time()
+            if math.isfinite(delta) and delta >= 0:
+                return delta
+        except Exception:
+            pass
+
+    return default
+
+
+def _is_discord_json_error(headers: Mapping[str, str] | None, body_bytes: bytes) -> bool:
+    """Return True if an HTTP error response looks like a JSON API response from Discord."""
+    content_type = (_header_get(headers, "Content-Type") or "").lower()
+    if "application/json" in content_type:
+        return True
+    if not body_bytes:
+        return False
+    try:
+        parsed = json.loads(body_bytes.decode("utf-8", errors="replace"))
+        return isinstance(parsed, dict)
+    except Exception:
+        return False
+
+
+def _sleep_within_deadline(
+    wait_time: float,
+    deadline: float,
+    exhaust_msg: str,
+    *,
+    strict_wait: bool = False,
+) -> None:
+    """Sleep before retrying without crossing the total deadline."""
+    remaining = deadline - time.monotonic()
+    if remaining <= 0 or (strict_wait and wait_time > remaining):
+        raise DiscordTemporaryError(exhaust_msg) from None
+    sleep_for = wait_time if strict_wait else min(wait_time, remaining)
+    if sleep_for > 0:
+        time.sleep(sleep_for)
+
+
 def post_to_discord(
     webhook_url: str,
     payload: dict[str, Any],
     max_retries: int = 3,
     initial_backoff: float = 1.0,
     max_backoff: float = 10.0,
+    total_timeout: float = DEFAULT_TOTAL_TIMEOUT,
 ) -> None:
-    """Send payload to the Discord webhook with retry logic for 429 and 5xx errors."""
+    """Send payload to the Discord webhook with retry, deadline, and secret redaction."""
     data = json.dumps(payload).encode("utf-8")
     masked_url = redact_webhook_url(webhook_url)
-
-    req = urllib.request.Request(
-        webhook_url,
-        data=data,
-        headers={
-            "Content-Type": "application/json",
-            "User-Agent": f"mail2hook (https://github.com/heliophane/mail2hook, {__version__})",
-        },
-        method="POST",
-    )
+    headers = {
+        "Content-Type": "application/json",
+        "User-Agent": f"DiscordBot (https://github.com/heliophane/mail2hook, {__version__})",
+    }
 
     attempts = 0
     backoff = initial_backoff
+    deadline = time.monotonic() + total_timeout
 
     while True:
         attempts += 1
+        req = urllib.request.Request(webhook_url, data=data, headers=headers, method="POST")
+        remaining = deadline - time.monotonic()
+        req_timeout = min(15.0, max(1.0, remaining)) if total_timeout > 0 else 1.0
+
         try:
-            with urllib.request.urlopen(req, timeout=15) as resp:
+            with _open_request(req, timeout=req_timeout) as resp:
                 # 204 No Content is standard for Discord webhooks
                 if resp.status in (200, 204):
                     return
-                # Unexpected status code
+                if 300 <= resp.status < 400:
+                    raise DiscordTemporaryError(
+                        f"Unexpected redirect HTTP {resp.status} (redirects disabled) "
+                        f"from Discord webhook {masked_url}"
+                    )
                 raise DiscordTemporaryError(
                     f"Unexpected status code {resp.status} from Discord webhook {masked_url}"
                 )
 
         except urllib.error.HTTPError as http_err:
-            status_code = http_err.code
+            try:
+                status_code = http_err.code
+                resp_headers = http_err.headers
+                try:
+                    raw_body = http_err.read(MAX_ERROR_BODY_BYTES)
+                except Exception:
+                    raw_body = b""
+            finally:
+                http_err.close()
 
-            # Handle Rate Limiting (429)
+            if 300 <= status_code < 400:
+                raise DiscordTemporaryError(
+                    f"Unexpected redirect HTTP {status_code} (redirects disabled) "
+                    f"from Discord webhook {masked_url}"
+                ) from None
+
             if status_code == 429:
                 if attempts > max_retries:
                     raise DiscordTemporaryError(
                         f"Rate limit retry attempts exhausted for Discord webhook {masked_url}"
-                    ) from http_err
+                    ) from None
 
-                retry_after_sec = 2.0
-                try:
-                    retry_header = http_err.headers.get("Retry-After")
-                    if retry_header:
-                        retry_after_sec = float(retry_header)
-                    else:
-                        error_body = http_err.read().decode("utf-8", errors="replace")
-                        body_data = json.loads(error_body)
-                        retry_after_sec = float(body_data.get("retry_after", 2.0))
-                except Exception:
-                    pass
-
-                sleep_time = min(retry_after_sec, max_backoff)
-                time.sleep(sleep_time)
+                retry_after_sec = _parse_retry_after(resp_headers, raw_body)
+                jitter = random.uniform(0.0, min(0.5, retry_after_sec * 0.25 + 0.05))
+                _sleep_within_deadline(
+                    retry_after_sec + jitter,
+                    deadline,
+                    f"Rate limit wait exceeds deadline for Discord webhook {masked_url}",
+                    strict_wait=True,
+                )
                 continue
 
-            # Transient 5xx server errors
-            if 500 <= status_code < 600:
+            is_cloudflare_403 = status_code == 403 and not _is_discord_json_error(
+                resp_headers, raw_body
+            )
+            if status_code == 408 or 500 <= status_code < 600 or is_cloudflare_403:
                 if attempts > max_retries:
                     raise DiscordTemporaryError(
                         f"Discord server error HTTP {status_code} on {masked_url} "
                         f"after {attempts} attempts"
-                    ) from http_err
+                    ) from None
 
-                sleep_time = min(backoff, max_backoff)
-                time.sleep(sleep_time)
+                jitter = random.uniform(0.0, min(0.5, backoff * 0.25))
+                _sleep_within_deadline(
+                    min(backoff + jitter, max_backoff + 0.5),
+                    deadline,
+                    f"Retry deadline exceeded after HTTP {status_code} on {masked_url}",
+                )
                 backoff *= 2.0
                 continue
 
-            # Permanent 4xx errors (e.g. 400 Bad Request, 401 Unauthorized, 404 Not Found)
             err_msg = f"Discord permanent error HTTP {status_code} on {masked_url}"
-            try:
-                details = http_err.read().decode("utf-8", errors="replace")
+            if raw_body:
+                details = redact_secrets(
+                    raw_body.decode("utf-8", errors="replace"),
+                    webhook_url,
+                )
                 if details:
-                    # Avoid logging secrets or excessive data
                     err_msg += f": {details[:200]}"
-            except Exception:
-                pass
-            raise DiscordPermanentError(err_msg, status_code=status_code) from http_err
+            raise DiscordPermanentError(err_msg, status_code=status_code) from None
 
-        except (urllib.error.URLError, TimeoutError, OSError) as net_err:
-            # Network or connection errors
+        except (http.client.HTTPException, urllib.error.URLError, TimeoutError, OSError) as net_err:
+            safe_net_err = redact_secrets(str(net_err), webhook_url)
             if attempts > max_retries:
                 raise DiscordTemporaryError(
-                    f"Network error communicating with Discord: {net_err}"
-                ) from net_err
+                    f"Network error communicating with Discord: {safe_net_err}"
+                ) from None
 
-            sleep_time = min(backoff, max_backoff)
-            time.sleep(sleep_time)
+            jitter = random.uniform(0.0, min(0.5, backoff * 0.25))
+            _sleep_within_deadline(
+                min(backoff + jitter, max_backoff + 0.5),
+                deadline,
+                f"Network retry deadline exceeded: {safe_net_err}",
+            )
             backoff *= 2.0
             continue

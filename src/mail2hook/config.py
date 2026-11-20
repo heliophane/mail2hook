@@ -47,7 +47,7 @@ def validate_webhook_url(url: str | None) -> str:
     if not url or not url.strip():
         raise ConfigError("Missing required environment variable: DISCORD_WEBHOOK_URL")
 
-    cleaned = url.strip()
+    cleaned = url.strip().rstrip("/")
     if not DISCORD_WEBHOOK_REGEX.match(cleaned):
         raise ConfigError(
             "Malformed DISCORD_WEBHOOK_URL: must be a valid Discord webhook URL "
