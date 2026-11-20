@@ -109,7 +109,7 @@ For multi-server deployment details and manual installation steps, see [docs/MUL
 
 Configuration lives in a single environment file:
 
-- **Path**: `/etc/mail2hook/env`
+- **Path**: `/etc/mail2hook/env` (when absent and running as non-root for local development, `./.env` may be used as a fallback; `./.env` is ignored when running as `root` or when `/etc/mail2hook/env` exists)
 - **Ownership & Mode**: `root:mail` (`0640`), inside `/etc/mail2hook` (`root:mail`, `0750`)
 
 This permission model allows `root` callers (`unattended-upgrades`, `apt-listchanges`, root `cron`) and any local service account explicitly added to the standard `mail` group (`sudo usermod -aG mail <user>`) to invoke `sendmail`, while keeping the webhook secret unreadable by unprivileged local users.
@@ -175,7 +175,7 @@ printf 'Subject: unattended-upgrades test\nFrom: root\n\nHello\n' | sudo mail2ho
 
 - `--file PATH`: Read raw email from a file instead of `stdin`.
 - `--dry-run`: Print the Discord JSON payload to `stdout` without sending.
-- `--env-file PATH`: Use a custom env file instead of `/etc/mail2hook/env` or `.env`.
+- `--env-file PATH`: Load configuration from a custom env file (fails with exit code `78` if missing or unreadable).
 - `--print-apt-config`: Print the recommended `/etc/apt/apt.conf.d/52mail2hook` snippet and exit.
 - `--doctor`: Print installation diagnostics (sendmail owner, Postfix route, env readability, redacted webhook ID, APT mail settings, installed MTAs, and sample dry-run) without exposing secrets.
 - `--doctor --send-test`: Run diagnostics and post a clearly labeled test message to Discord.

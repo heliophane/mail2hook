@@ -17,7 +17,7 @@ This repo is **public**. Never commit secrets or personal data.
 ## How it is deployed
 
 - Installed as a standalone executable at `/usr/local/bin/mail2hook`, registered via `update-alternatives` (`mta` -> `/usr/sbin/sendmail`, slave `mta-mailq` -> `/usr/bin/mailq`) when no conflicting MTA is present.
-- Config is read from `/etc/mail2hook/env` (`root:mail`, mode `0640`), `--env-file PATH`, `.env`, or environment variables.
+- Config is read from `/etc/mail2hook/env` (`root:mail`, mode `0640`), `--env-file PATH`, `.env` (non-root local dev only when `/etc/mail2hook/env` is absent), or environment variables.
 - Installable via `install.sh`, `pip install .`, or `pipx install .`.
 
 ## Security rules (highest priority)

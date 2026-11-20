@@ -20,6 +20,7 @@ from mail2hook.config import (
     DEFAULT_SYSTEM_ENV_PATH,
     Config,
     ConfigError,
+    _is_running_as_root,
     load_config,
 )
 from mail2hook.discord import (
@@ -406,10 +407,11 @@ def inspect_env_file(env_file: Path | None = None) -> dict[str, str]:
     if system_info["exists"] != "no":
         return system_info
 
-    local_env = Path(".env")
-    local_info = _inspect_single_env_path(local_env)
-    if local_info["exists"] != "no":
-        return local_info
+    if not _is_running_as_root():
+        local_env = Path(".env")
+        local_info = _inspect_single_env_path(local_env)
+        if local_info["exists"] != "no":
+            return local_info
 
     return system_info
 

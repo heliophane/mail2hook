@@ -11,6 +11,9 @@ from pathlib import Path
 DEFAULT_SYSTEM_ENV_PATH = Path("/etc/mail2hook/env")
 DEFAULT_MAX_BODY_CHARS = 1500
 DEFAULT_DISCORD_USERNAME = "mail2hook"
+MAX_DISCORD_USERNAME_LEN = 80
+_FORBIDDEN_USERNAME_SUBSTRINGS = ("discord", "clyde", "```")
+_FORBIDDEN_EXACT_USERNAMES = frozenset({"everyone", "here", "@everyone", "@here"})
 
 # Match standard Discord webhook URLs (including ptb, canary, and discordapp domains)
 DISCORD_WEBHOOK_REGEX = re.compile(
@@ -56,17 +59,47 @@ def validate_webhook_url(url: str | None) -> str:
     return cleaned
 
 
+def validate_discord_username(raw_username: str | None) -> str:
+    """Validate and normalize DISCORD_USERNAME per Discord webhook restrictions."""
+    username = (raw_username or "").strip()
+    if not username:
+        return DEFAULT_DISCORD_USERNAME
+    if len(username) > MAX_DISCORD_USERNAME_LEN:
+        raise ConfigError(
+            f"Invalid DISCORD_USERNAME: length {len(username)} exceeds maximum "
+            f"{MAX_DISCORD_USERNAME_LEN} characters"
+        )
+    lowered = username.lower()
+    for forbidden in _FORBIDDEN_USERNAME_SUBSTRINGS:
+        if forbidden in lowered:
+            raise ConfigError(f"Invalid DISCORD_USERNAME: must not contain '{forbidden}'")
+    if lowered in _FORBIDDEN_EXACT_USERNAMES:
+        raise ConfigError(f"Invalid DISCORD_USERNAME: '{username}' is reserved by Discord")
+    return username
+
+
+def _is_running_as_root() -> bool:
+    """Return True if the effective user ID is root (uid 0)."""
+    return hasattr(os, "geteuid") and os.geteuid() == 0
+
+
 def _strip_inline_comment(value: str) -> str:
     """Strip unquoted inline comments and surrounding matching quotes from an env value."""
     val = value.strip()
-    if not val:
+    if not val or val.startswith("#"):
         return ""
-    if (val.startswith('"') and val.endswith('"') and len(val) >= 2) or (
-        val.startswith("'") and val.endswith("'") and len(val) >= 2
-    ):
-        return val[1:-1]
-    if " #" in val:
-        val = val.split(" #", 1)[0].strip()
+
+    if val[0] in ('"', "'"):
+        quote = val[0]
+        for idx in range(1, len(val)):
+            if val[idx] == quote:
+                remainder = val[idx + 1 :].lstrip()
+                if not remainder or remainder.startswith("#"):
+                    return val[1:idx]
+
+    match = re.search(r"\s+#", val)
+    if match:
+        return val[: match.start()].strip()
     return val
 
 
@@ -101,8 +134,18 @@ def _safe_load_dotenv(path: Path, *, ignore_missing: bool = False) -> dict[str, 
                 result[key] = _strip_inline_comment(value)
         elif "discord.com/api/webhooks/" in line or "discordapp.com/api/webhooks/" in line:
             # The user pasted the bare webhook URL directly without key= prefix
-            result["DISCORD_WEBHOOK_URL"] = line
+            result["DISCORD_WEBHOOK_URL"] = _strip_inline_comment(line)
     return result
+
+
+def _try_load_dotenv(path: Path) -> tuple[dict[str, str], bool, ConfigError | None]:
+    """Load an optional default env file, returning (vars, file_present, load_error)."""
+    try:
+        return _safe_load_dotenv(path, ignore_missing=False), True, None
+    except ConfigError as err:
+        if isinstance(err.__cause__, FileNotFoundError):
+            return {}, False, None
+        return {}, True, err
 
 
 def load_config(
@@ -114,30 +157,28 @@ def load_config(
     """Load and validate configuration from files and environment variables.
 
     Loading order:
-    1. If `env_file` is provided, load variables from it.
+    1. If `env_file` is provided, load variables from it (fails if missing/unreadable).
     2. Otherwise, if `load_default_files` is True (default when `environ` is None),
-       load from `/etc/mail2hook/env` and `.env` if present.
+       load from `/etc/mail2hook/env` if present, or `.env` only when not running as root
+       and `/etc/mail2hook/env` does not exist.
     3. Override with explicit environment variables (`environ` or `os.environ`).
     """
     file_vars: dict[str, str] = {}
     system_env_perm_error: ConfigError | None = None
     if env_file is not None:
         custom_path = Path(env_file)
-        file_vars.update(_safe_load_dotenv(custom_path, ignore_missing=True))
+        file_vars.update(_safe_load_dotenv(custom_path, ignore_missing=False))
     else:
         should_load_defaults = (
             (environ is None) if load_default_files is None else load_default_files
         )
         if should_load_defaults:
-            try:
-                file_vars.update(_safe_load_dotenv(DEFAULT_SYSTEM_ENV_PATH, ignore_missing=True))
-            except ConfigError as err:
-                if isinstance(err.__cause__, PermissionError):
-                    system_env_perm_error = err
-                else:
-                    raise
-            local_env = Path(".env")
-            file_vars.update(_safe_load_dotenv(local_env, ignore_missing=True))
+            sys_vars, system_env_present, system_env_perm_error = _try_load_dotenv(
+                DEFAULT_SYSTEM_ENV_PATH
+            )
+            file_vars.update(sys_vars)
+            if not system_env_present and not _is_running_as_root():
+                file_vars.update(_safe_load_dotenv(Path(".env"), ignore_missing=True))
 
     active_environ = os.environ if environ is None else environ
     env_map: dict[str, str] = {**file_vars, **active_environ}
@@ -165,9 +206,7 @@ def load_config(
     else:
         max_body_chars = DEFAULT_MAX_BODY_CHARS
 
-    discord_username = env_map.get("DISCORD_USERNAME", DEFAULT_DISCORD_USERNAME).strip()
-    if not discord_username:
-        discord_username = DEFAULT_DISCORD_USERNAME
+    discord_username = validate_discord_username(env_map.get("DISCORD_USERNAME"))
 
     filter_senders = _parse_comma_list(env_map.get("FILTER_SENDERS"))
     filter_subject_keywords = _parse_comma_list(env_map.get("FILTER_SUBJECT_KEYWORDS"))
