@@ -70,16 +70,22 @@ def _strip_inline_comment(value: str) -> str:
     return val
 
 
-def _safe_load_dotenv(path: Path) -> dict[str, str]:
+def _safe_load_dotenv(path: Path, *, ignore_missing: bool = False) -> dict[str, str]:
     """Safely load variables from a KEY=VALUE env file without external dependencies."""
     try:
         raw_text = path.read_text(encoding="utf-8", errors="replace")
     except PermissionError as err:
         raise ConfigError(
             f"Permission denied reading configuration file '{path}'. "
-            f"Ensure the running user has read access "
-            f"(e.g. sudo chown root:mail {path} && sudo chmod 0640 {path})"
+            f"Ensure the running user has traverse access to '{path.parent}' (0750) "
+            f"and read access to '{path}' (0640), e.g. via the 'mail' group "
+            f"(sudo chown root:mail {path.parent} {path} && "
+            f"sudo chmod 0750 {path.parent} && sudo chmod 0640 {path})"
         ) from err
+    except (FileNotFoundError, IsADirectoryError, NotADirectoryError) as err:
+        if ignore_missing:
+            return {}
+        raise ConfigError(f"Configuration file not found or unreadable: '{path}'") from err
 
     result: dict[str, str] = {}
     for raw_line in raw_text.splitlines():
@@ -114,20 +120,24 @@ def load_config(
     3. Override with explicit environment variables (`environ` or `os.environ`).
     """
     file_vars: dict[str, str] = {}
+    system_env_perm_error: ConfigError | None = None
     if env_file is not None:
         custom_path = Path(env_file)
-        if custom_path.is_file():
-            file_vars.update(_safe_load_dotenv(custom_path))
+        file_vars.update(_safe_load_dotenv(custom_path, ignore_missing=True))
     else:
         should_load_defaults = (
             (environ is None) if load_default_files is None else load_default_files
         )
         if should_load_defaults:
-            if DEFAULT_SYSTEM_ENV_PATH.is_file():
-                file_vars.update(_safe_load_dotenv(DEFAULT_SYSTEM_ENV_PATH))
+            try:
+                file_vars.update(_safe_load_dotenv(DEFAULT_SYSTEM_ENV_PATH, ignore_missing=True))
+            except ConfigError as err:
+                if isinstance(err.__cause__, PermissionError):
+                    system_env_perm_error = err
+                else:
+                    raise
             local_env = Path(".env")
-            if local_env.is_file():
-                file_vars.update(_safe_load_dotenv(local_env))
+            file_vars.update(_safe_load_dotenv(local_env, ignore_missing=True))
 
     active_environ = os.environ if environ is None else environ
     env_map: dict[str, str] = {**file_vars, **active_environ}
@@ -138,6 +148,8 @@ def load_config(
         or env_map.get("DISCORD_WEBHOOK")
         or env_map.get("WEBHOOK_URL")
     )
+    if (not raw_webhook or not raw_webhook.strip()) and system_env_perm_error is not None:
+        raise system_env_perm_error
     webhook_url = validate_webhook_url(raw_webhook)
 
     max_body_chars_raw = env_map.get("MAX_BODY_CHARS")

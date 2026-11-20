@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 import pytest
@@ -137,3 +138,34 @@ def test_load_config_quotes_comments_and_export(tmp_path: Path) -> None:
     assert cfg.discord_webhook_url == VALID_WEBHOOK_URL
     assert cfg.discord_username == "QuotedBot"
     assert cfg.server_name == "web01"
+
+
+def test_load_config_directory_eacces_surfaces_permission_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    if hasattr(os, "geteuid") and os.geteuid() == 0:
+        pytest.skip("root bypasses DAC directory permissions")
+
+    locked_dir = tmp_path / "locked_dir"
+    locked_dir.mkdir(mode=0o755)
+    env_file = locked_dir / "env"
+    env_file.write_text(f"DISCORD_WEBHOOK_URL={VALID_WEBHOOK_URL}\n")
+    env_file.chmod(0o640)
+    locked_dir.chmod(0o000)
+
+    try:
+        with pytest.raises(ConfigError, match="Permission denied reading configuration file"):
+            load_config(env_file=env_file, environ={})
+
+        monkeypatch.setattr("mail2hook.config.DEFAULT_SYSTEM_ENV_PATH", env_file)
+        with pytest.raises(ConfigError, match="Permission denied reading configuration file"):
+            load_config(load_default_files=True, environ={})
+
+        cfg = load_config(
+            load_default_files=True,
+            environ={"DISCORD_WEBHOOK_URL": VALID_WEBHOOK_URL},
+        )
+        assert cfg.discord_webhook_url == VALID_WEBHOOK_URL
+    finally:
+        locked_dir.chmod(0o755)
+        env_file.chmod(0o644)

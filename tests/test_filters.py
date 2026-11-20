@@ -29,7 +29,7 @@ def test_matches_sender_exact() -> None:
 def test_matches_sender_domain() -> None:
     assert matches_sender("root@server01.example.com", ["example.com"]) is True
     assert matches_sender("root@server01.example.com", ["@example.com"]) is True
-    assert matches_sender("root@other.org", ["example.com"]) is False
+    assert matches_sender("root@other.example.org", ["example.com"]) is False
 
 
 def test_matches_sender_username() -> None:
@@ -75,7 +75,7 @@ def test_should_process_message_with_filters() -> None:
 
     # Sender mismatch
     msg2 = _make_msg(
-        sender="hacker@other.com",
+        sender="hacker@other.example.com",
         subject="unattended-upgrades result: SUCCESS",
     )
     assert should_process_message(msg2, config) is False
