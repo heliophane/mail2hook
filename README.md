@@ -273,6 +273,8 @@ When piped via `curl`, `install.sh` fetches the latest GitHub release tag (falli
 curl -fsSL https://raw.githubusercontent.com/heliophane/mail2hook/main/install.sh | sudo bash -s -- --yes
 ```
 
+See [CHANGELOG.md](CHANGELOG.md) for release notes and version history.
+
 ### Uninstall
 
 Run directly from a checkout or remotely via `curl`:
