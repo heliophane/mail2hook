@@ -16,7 +16,7 @@ This repo is **public**. Never commit secrets or personal data.
 
 ## How it is deployed
 
-- Installed as a standalone executable at `/usr/local/bin/mail2hook`, registered via `update-alternatives` (`mta` -> `/usr/sbin/sendmail`, slave `mta-mailq` -> `/usr/bin/mailq`) when no conflicting MTA is present.
+- Installed as a standalone executable at `/usr/local/bin/mail2hook`, registered via `update-alternatives` (`mta` -> `/usr/sbin/sendmail`, slave `mta-mailq` -> `/usr/bin/mailq`) when no conflicting MTA is present, or wired as a dedicated Postfix pipe transport (`mail2hook@localhost`) when Postfix is installed.
 - Config is read from `/etc/mail2hook/env` (`root:mail`, mode `0640`), `--env-file PATH`, `.env` (non-root local dev only when `/etc/mail2hook/env` is absent), or environment variables.
 - Installable via `install.sh`, `pip install .`, or `pipx install .`.
 
@@ -24,7 +24,7 @@ This repo is **public**. Never commit secrets or personal data.
 
 1. **Never hardcode or print secrets.** The Discord webhook URL comes from `/etc/mail2hook/env` or environment variables, never CLI arguments.
 2. **Never commit `.env`.** Commit only `.env.example` with placeholder values.
-3. **Do not log the webhook URL or full email bodies.** Always use `redact_webhook_url` in errors.
+3. **Do not log the webhook URL or full email bodies.** Always use `redact_webhook_url` and `redact_secrets` in errors and logs.
 4. **Treat all email content as untrusted input.** Never execute, eval, or shell out with email-derived strings. Set `"allowed_mentions": {"parse": []}` in every Discord payload and sanitize inline code spans.
 5. **Do not add real emails, hostnames, IPs, or account links** to tests, fixtures, docs, or commit messages. Use fake data (`user@example.com`, `server01.example.com`).
 6. **Exit with standard `sysexits.h` codes**: `0` (`EX_OK`) on success/filtered, `65` (`EX_DATAERR`) on unparseable/oversized input or HTTP `400`, `75` (`EX_TEMPFAIL`) on rate limit/`5xx`/network errors, `78` (`EX_CONFIG`) on missing/invalid config or HTTP `401`/`403`/`404`.
@@ -38,7 +38,7 @@ All config is via environment variables (see `.env.example`):
 | `DISCORD_WEBHOOK_URL` | Required (aliases: `DISCORD_WEBHOOK`, `WEBHOOK_URL`). Discord webhook URL |
 | `SERVER_NAME` | Optional (alias: `HOSTNAME_OVERRIDE`). Server name override |
 | `FILTER_SENDERS` | Optional. Comma-separated sender addresses, domains, or usernames to match |
-| `FILTER_SUBJECT_KEYWORDS` | Optional. Comma-separated subject keywords to match (case-insensitive) |
+| `FILTER_SUBJECT_KEYWORDS` | Optional. Comma-separated subject keywords to match (case-insensitive; `install.sh` defaults to `unattended-upgrades`) |
 | `MAX_BODY_CHARS` | Optional. Excerpt length, default `1500` |
 | `DISCORD_USERNAME` | Optional. Display name for posts, default `mail2hook` |
 

@@ -142,10 +142,49 @@ def test_detect_status() -> None:
     assert detect_status("Weekly cron report", "All jobs completed") == "info"
     assert detect_status("Backup failed: timeout", "Connection lost") == "failure"
     assert detect_status("Database error alert", "Crash detected") == "failure"
+    assert (
+        detect_status(
+            "unattended-upgrades result for server01.example.com: False",
+            "Unattended upgrade returned: False",
+        )
+        == "failure"
+    )
+    assert (
+        detect_status(
+            "unattended-upgrades result for server01.example.com",
+            "Unattended upgrade returned: False",
+        )
+        == "failure"
+    )
+    assert (
+        detect_status(
+            "unattended-upgrades result for server01.example.com",
+            "Packages with upgradable origin but kept back:\n linux-image-amd64",
+        )
+        == "warning"
+    )
+    assert detect_status("Backup warning: disk 85% full", "Check /var usage") == "warning"
+    assert (
+        detect_status(
+            "unattended-upgrades result for server01.example.com: FAILURE",
+            "Unattended upgrade returned: False\n"
+            "Packages with upgradable origin but kept back:\n linux-image-amd64",
+        )
+        == "failure"
+    )
     assert detect_status("Daily status: SUCCESS", "All good") == "success"
-    # Avoid substring false positives on 'fail2ban' or '0 errors'
+    assert (
+        detect_status(
+            "unattended-upgrades result for server01.example.com",
+            "Unattended upgrade returned: True",
+        )
+        == "success"
+    )
+    # Avoid substring false positives on 'fail2ban', '0 errors', '0 warnings', or 'No warnings'
     assert detect_status("fail2ban daily summary", "Banned 3 IPs") == "info"
     assert detect_status("Upgrade report: 0 errors", "Completed") == "info"
+    assert detect_status("Backup report: 0 warnings", "Completed") == "info"
+    assert detect_status("No warnings found", "Completed") == "info"
 
 
 def test_extract_hostname() -> None:

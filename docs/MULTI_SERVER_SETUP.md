@@ -7,28 +7,41 @@ This guide covers deploying `mail2hook` across Debian and Ubuntu servers so syst
 ## Architecture Overview
 
 ```text
-unattended-upgrades / cron / apt-listchanges
-                  │
-                  ▼
-     /usr/sbin/sendmail -t -oi
-                  │  (update-alternatives: mta)
-                  ▼
-     /usr/local/bin/mail2hook
-                  │  reads /etc/mail2hook/env (root:mail, 0640)
-                  ▼
-       HTTPS POST -> Discord Webhook API
+Standard host (no existing MTA):
+  unattended-upgrades / cron / apt-listchanges
+                    │
+                    ▼
+       /usr/sbin/sendmail -t -oi
+                    │  (update-alternatives: mta)
+                    ▼
+       /usr/local/bin/mail2hook
+                    │  reads /etc/mail2hook/env (root:mail, 0640)
+                    ▼
+         HTTPS POST -> Discord Webhook API
+
+Host with Postfix (e.g. Proxmox VE):
+  unattended-upgrades ──▶ mail2hook@localhost ──▶ Postfix pipe (nobody:mail) ──▶ /usr/local/bin/mail2hook ──▶ Discord
+  other root / cron mail ──▶ /usr/sbin/sendmail (Postfix untouched)
 ```
 
-`mail2hook` runs only when `sendmail` is invoked, posts the embed, and exits.
+`mail2hook` runs only when `sendmail` (or the Postfix pipe) is invoked, posts the embed, and exits.
 
 ---
 
 ## Automated Setup (Recommended)
 
-Run the installer on each server:
+Run the installer interactively on each server:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/heliophane/mail2hook/main/install.sh | sudo bash
+```
+
+For non-interactive / automated fleet rollout, pass `DISCORD_WEBHOOK_URL` via environment variable with `--yes`:
+
+```bash
+export DISCORD_WEBHOOK_URL="https://discord.com/api/webhooks/123456789012345678/example-token-placeholder"
+curl -fsSL https://raw.githubusercontent.com/heliophane/mail2hook/main/install.sh \
+  | sudo --preserve-env=DISCORD_WEBHOOK_URL bash -s -- --yes
 ```
 
 To customize the server name shown in Discord embeds, set `SERVER_NAME` in `/etc/mail2hook/env`:
@@ -84,6 +97,7 @@ SERVER_NAME=prod-db01
 5. **Configure `unattended-upgrades` and verify**:
    ```bash
    /usr/local/bin/mail2hook --print-apt-config | sudo tee /etc/apt/apt.conf.d/52-unattended-upgrades-local >/dev/null
+   sudo mail2hook --doctor
    printf 'To: root\nFrom: root\nSubject: unattended-upgrades test\n\nHello\n' | sudo sendmail -oi -t
    sudo unattended-upgrade --dry-run --debug
    ```
@@ -93,12 +107,18 @@ SERVER_NAME=prod-db01
 
 ## Checking Logs & Pending Reboots
 
+- **Mail2hook delivery logs & diagnostics**:
+  ```bash
+  sudo mail2hook --doctor
+  sudo journalctl -t mail2hook -n 50 --no-pager
+  ```
 - **Upgrade logs**:
   ```bash
   sudo tail -n 50 /var/log/unattended-upgrades/unattended-upgrades.log
   sudo tail -n 50 /var/log/unattended-upgrades/unattended-upgrades-dpkg.log
   ```
 - **Pending reboot**:
+  When a reboot is needed, `mail2hook` turns the embed bar **yellow** and shows `Reboot: ⚠️ Required`. Verify manually on the server with:
   ```bash
   if [ -f /var/run/reboot-required ]; then
     cat /var/run/reboot-required

@@ -53,7 +53,7 @@ class ParsedMessage:
     date: str
     body: str
     to: str = ""
-    status: str = "info"  # "success", "failure", or "info"
+    status: str = "info"  # "success", "warning", "failure", or "info"
     hostname: str | None = None
     reboot_required: bool = False
     reboot_packages: list[str] = field(default_factory=list)
@@ -583,25 +583,46 @@ _SUBJECT_FAILURE_RE = re.compile(
     r"(?<!\bno\s)(?<!\b0\s)\b(?:fail(?:ed|ure|ures)?|errors?|critical|broken|fatal|alert)\b",
     re.IGNORECASE,
 )
+_SUBJECT_UNATTENDED_FALSE_RE = re.compile(
+    r"\bunattended[- ]upgrades?\b.*:\s*false\b",
+    re.IGNORECASE,
+)
+_SUBJECT_WARNING_RE = re.compile(
+    r"(?<!\bno\s)(?<!\b0\s)\bwarn(?:ing|ings)?\b",
+    re.IGNORECASE,
+)
 _SUBJECT_SUCCESS_RE = re.compile(r"\bsuccess(?:ful|fully)?\b", re.IGNORECASE)
 
 
 def detect_status(subject: str, body: str) -> str:
-    """Determine message status (success, failure, or info) from subject and body."""
+    """Determine message status (success, warning, failure, or info) from subject and body."""
     body_lower = body.lower()
 
-    # Check explicit unattended-upgrades body outcomes first
+    # 1. Explicit failures take highest precedence
     if (
         "unattended upgrade result: some errors" in body_lower
+        or "unattended upgrade returned: false" in body_lower
         or "packages that failed" in body_lower
         or "dpkg: error" in body_lower
     ):
         return "failure"
 
-    if _SUBJECT_FAILURE_RE.search(subject):
+    if _SUBJECT_FAILURE_RE.search(subject) or _SUBJECT_UNATTENDED_FALSE_RE.search(subject):
         return "failure"
 
-    if _SUBJECT_SUCCESS_RE.search(subject) or "all upgrades installed" in body_lower:
+    # 2. Warnings (subject warning or packages kept back / upgrade attention needed)
+    if (
+        _SUBJECT_WARNING_RE.search(subject)
+        or "packages with upgradable origin but kept back:" in body_lower
+    ):
+        return "warning"
+
+    # 3. Clean successes
+    if (
+        _SUBJECT_SUCCESS_RE.search(subject)
+        or "all upgrades installed" in body_lower
+        or "unattended upgrade returned: true" in body_lower
+    ):
         return "success"
 
     return "info"

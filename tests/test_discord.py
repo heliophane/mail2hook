@@ -18,6 +18,7 @@ from mail2hook.discord import (
     COLOR_FAILURE,
     COLOR_INFO,
     COLOR_SUCCESS,
+    COLOR_WARNING,
     MAX_ERROR_BODY_BYTES,
     DiscordPermanentError,
     DiscordTemporaryError,
@@ -38,6 +39,7 @@ def _make_msg(
     subject: str = "Test Subject",
     body: str = "Test body",
     hostname: str | None = "server01.example.com",
+    reboot_required: bool = False,
 ) -> ParsedMessage:
     return ParsedMessage(
         sender="root@server01.example.com",
@@ -46,6 +48,7 @@ def _make_msg(
         body=body,
         status=status,
         hostname=hostname,
+        reboot_required=reboot_required,
     )
 
 
@@ -92,7 +95,8 @@ def test_build_payload_structure_and_limits() -> None:
     # Fields
     field_names = [f["name"] for f in embed["fields"]]
     assert "Server" in field_names
-    assert "From" in field_names
+    assert "From" not in field_names
+    assert "To" not in field_names
     assert "Date" in field_names
     assert "Server Logs" in field_names
 
@@ -126,22 +130,6 @@ def test_get_os_info() -> None:
     # Should run safely without error on any OS (returns str or None)
     os_info = get_os_info()
     assert os_info is None or isinstance(os_info, str)
-
-
-def test_format_sender() -> None:
-    from mail2hook.discord import format_sender
-
-    # Duplicate name and localpart
-    assert format_sender("root <root@ubuntu24>", "ubuntu24") == "root@ubuntu24"
-    # Bare local name without @
-    assert format_sender("root", "server01") == "root@server01"
-    # @localhost
-    assert format_sender("root@localhost", "server01") == "root@server01"
-    # Distinct name and address
-    assert (
-        format_sender("Alerts System <alerts@monitor.example.com>", "server01")
-        == "Alerts System (alerts@monitor.example.com)"
-    )
 
 
 def test_get_log_reminder() -> None:
@@ -186,6 +174,7 @@ def test_build_payload_reboot_field() -> None:
         reboot_packages=["linux-image-6.8.0-generic"],
     )
     payload = build_payload(msg_reboot, config)
+    assert payload["embeds"][0]["color"] == COLOR_WARNING
     reboot_field = next(f for f in payload["embeds"][0]["fields"] if f["name"] == "Reboot")
     assert "Required" in reboot_field["value"]
     assert "linux-image-6.8.0-generic" in reboot_field["value"]
@@ -201,6 +190,7 @@ def test_build_payload_reboot_field() -> None:
         reboot_required=False,
     )
     payload_no = build_payload(msg_no_reboot, config)
+    assert payload_no["embeds"][0]["color"] == COLOR_SUCCESS
     reboot_field_no = next(f for f in payload_no["embeds"][0]["fields"] if f["name"] == "Reboot")
     assert "Not needed" in reboot_field_no["value"]
 
@@ -216,13 +206,19 @@ def test_build_payload_sanitizes_backticks() -> None:
 def test_build_payload_colors() -> None:
     config = Config(discord_webhook_url=FAKE_WEBHOOK_URL)
 
-    msg_fail = _make_msg(status="failure")
-    payload_fail = build_payload(msg_fail, config)
-    assert payload_fail["embeds"][0]["color"] == COLOR_FAILURE
-
-    msg_info = _make_msg(status="info")
-    payload_info = build_payload(msg_info, config)
-    assert payload_info["embeds"][0]["color"] == COLOR_INFO
+    cases = [
+        ("success", False, COLOR_SUCCESS),
+        ("success", True, COLOR_WARNING),
+        ("info", True, COLOR_WARNING),
+        ("warning", False, COLOR_WARNING),
+        ("failure", False, COLOR_FAILURE),
+        ("failure", True, COLOR_FAILURE),
+        ("info", False, COLOR_INFO),
+    ]
+    for status, reboot_required, expected_color in cases:
+        msg = _make_msg(status=status, reboot_required=reboot_required)
+        payload = build_payload(msg, config)
+        assert payload["embeds"][0]["color"] == expected_color
 
 
 def _make_headers(mapping: dict[str, str] | None = None) -> Message:
@@ -506,7 +502,7 @@ def test_post_to_discord_http_exception_fresh_request_bounded_read_and_redaction
     assert perm_exc.value.__cause__ is None
 
 
-def test_build_payload_to_field_and_total_embed_limit() -> None:
+def test_build_payload_omits_from_to_and_enforces_total_embed_limit() -> None:
     config = Config(discord_webhook_url=FAKE_WEBHOOK_URL, max_body_chars=8000)
     msg = ParsedMessage(
         sender="root@server01.example.com",
@@ -519,8 +515,9 @@ def test_build_payload_to_field_and_total_embed_limit() -> None:
     )
     payload = build_payload(msg, config)
     embed = payload["embeds"][0]
-    to_field = next(f for f in embed["fields"] if f["name"] == "To")
-    assert to_field["value"] == "ops@example.com"
+    field_names = [f["name"] for f in embed["fields"]]
+    assert "From" not in field_names
+    assert "To" not in field_names
     assert len(embed["title"]) <= 256
     assert len(embed["description"]) <= 4096
     assert len(embed["author"]["name"]) <= 256

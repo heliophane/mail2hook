@@ -19,7 +19,12 @@ from mail2hook.cli import (
     EXIT_TEMPFAIL,
     run,
 )
-from mail2hook.discord import DiscordPermanentError, DiscordTemporaryError
+from mail2hook.discord import (
+    COLOR_SUCCESS,
+    COLOR_WARNING,
+    DiscordPermanentError,
+    DiscordTemporaryError,
+)
 
 FIXTURES_DIR = Path(__file__).parent / "fixtures"
 VALID_WEBHOOK_URL = (
@@ -213,10 +218,11 @@ def test_cli_sendmail_envelope_sender_and_dot_eof(monkeypatch: pytest.MonkeyPatc
     embed = payload["embeds"][0]
     assert ".leading dot" in embed["description"]
     assert "Ignored after single dot" not in embed["description"]
-    from_field = next(f for f in embed["fields"] if f["name"] == "From")
-    assert "Cron Daemon (root@server01.example.com)" == from_field["value"]
-    to_field = next(f for f in embed["fields"] if f["name"] == "To")
-    assert to_field["value"] == "root"
+    field_names = [f["name"] for f in embed["fields"]]
+    assert "From" not in field_names
+    assert "To" not in field_names
+    server_field = next(f for f in embed["fields"] if f["name"] == "Server")
+    assert server_field["value"] == "`server01.example.com`"
 
 
 def test_cli_oversized_input(
@@ -267,10 +273,12 @@ def test_cli_postfix_pipe_invocation_unattended_upgrades(
     assert mock_post.call_count == 1
     payload = mock_post.call_args[0][1]
     embed = payload["embeds"][0]
+    field_names = [f["name"] for f in embed["fields"]]
+    assert "From" not in field_names
+    assert "To" not in field_names
+    assert embed["color"] == COLOR_SUCCESS
     server_field = next(f for f in embed["fields"] if f["name"] == "Server")
-    to_field = next(f for f in embed["fields"] if f["name"] == "To")
     assert server_field["value"] == "`pve01.example.com`"
-    assert to_field["value"] == "mail2hook@localhost"
 
 
 @pytest.mark.parametrize(
@@ -332,6 +340,12 @@ def test_cli_default_subject_filter_forwards_unattended_upgrades_mail(
 
     assert exit_code == EXIT_OK
     assert mock_post.call_count == 1
+    payload = mock_post.call_args[0][1]
+    embed = payload["embeds"][0]
+    assert embed["color"] == COLOR_WARNING
+    field_names = [f["name"] for f in embed["fields"]]
+    assert "From" not in field_names
+    assert "To" not in field_names
 
 
 def test_cli_e2e_marker_success_filtered_failure_and_dry_run(

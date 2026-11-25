@@ -15,7 +15,7 @@ import urllib.error
 import urllib.request
 from collections.abc import Mapping
 from datetime import UTC
-from email.utils import parseaddr, parsedate_to_datetime
+from email.utils import parsedate_to_datetime
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
@@ -38,6 +38,7 @@ MAX_EMBED_TOTAL_CHARS = 6000
 
 # Colors (decimal)
 COLOR_SUCCESS = 0x57F287  # Green
+COLOR_WARNING = 0xFEE75C  # Yellow
 COLOR_FAILURE = 0xED4245  # Red
 COLOR_INFO = 0x5865F2  # Blurple
 
@@ -124,31 +125,6 @@ def redact_secrets(text: str, webhook_url: str | None = None) -> str:
     result = _WEBHOOK_SECRET_RE.sub(r"\1[REDACTED]", result)
     result = _URL_USERINFO_RE.sub(r"\1[REDACTED]@", result)
     return result
-
-
-def format_sender(sender: str, hostname: str | None) -> str:
-    """Format sender cleanly for Discord without duplicate names or broken angles."""
-    name, addr = parseaddr(sender)
-    name = name.strip()
-    addr = addr.strip()
-
-    # If address has no @ or is localhost, associate with hostname if known
-    if addr:
-        if "@" not in addr and hostname:
-            addr = f"{addr}@{hostname}"
-        elif (addr.endswith("@localhost") or addr.endswith("@localdomain")) and hostname:
-            user = addr.split("@")[0]
-            addr = f"{user}@{hostname}"
-
-    if not addr:
-        return sender.strip()
-
-    # If name is redundant with the localpart (e.g. name='root', addr='root@ubuntu24')
-    localpart = addr.split("@")[0]
-    if not name or name.lower() == localpart.lower():
-        return addr
-
-    return f"{name} ({addr})"
 
 
 def get_log_reminder(
@@ -241,11 +217,14 @@ def get_effective_hostname(msg: ParsedMessage, config: Config) -> str | None:
 
 def build_payload(msg: ParsedMessage, config: Config) -> dict[str, Any]:
     """Construct the Discord webhook payload dictionary."""
-    color = COLOR_INFO
-    if msg.status == "success":
-        color = COLOR_SUCCESS
-    elif msg.status == "failure":
+    if msg.status == "failure":
         color = COLOR_FAILURE
+    elif msg.reboot_required or msg.status == "warning":
+        color = COLOR_WARNING
+    elif msg.status == "success":
+        color = COLOR_SUCCESS
+    else:
+        color = COLOR_INFO
 
     max_desc = min(config.max_body_chars, MAX_DESCRIPTION_CHARS)
     desc = truncate_text(msg.body, max_desc) if msg.body else "(no content)"
@@ -295,24 +274,6 @@ def build_payload(msg: ParsedMessage, config: Config) -> dict[str, Any]:
             {
                 "name": "Reboot",
                 "value": truncate_text(reboot_value, MAX_FIELD_VALUE_CHARS),
-                "inline": True,
-            }
-        )
-
-    sender_formatted = format_sender(msg.sender, hostname)
-    fields.append(
-        {
-            "name": "From",
-            "value": truncate_text(sender_formatted, MAX_FIELD_VALUE_CHARS),
-            "inline": True,
-        }
-    )
-
-    if msg.to:
-        fields.append(
-            {
-                "name": "To",
-                "value": truncate_text(msg.to, MAX_FIELD_VALUE_CHARS),
                 "inline": True,
             }
         )

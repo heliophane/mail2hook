@@ -50,8 +50,10 @@ APT::Periodic::Unattended-Upgrade "1";
 APT::Periodic::AutocleanInterval "7";
 
 // 2. Deliver upgrade reports to mail2hook
-// When mail2hook is linked to /usr/sbin/sendmail,
-// unattended-upgrades delivers directly to mail2hook.
+// When mail2hook is linked to /usr/sbin/sendmail, use "root" (paired with
+// FILTER_SUBJECT_KEYWORDS=unattended-upgrades in /etc/mail2hook/env).
+// On Postfix hosts using the mail2hook pipe transport, use "mail2hook@localhost":
+//   Unattended-Upgrade::Mail "mail2hook@localhost";
 Unattended-Upgrade::Mail "root";
 
 // 3. Reporting frequency:
@@ -66,7 +68,8 @@ Unattended-Upgrade::Sender "unattended-upgrades";
 
 // 5. Reboot settings (optional)
 // By default, unattended-upgrades will NOT reboot automatically.
-// Mail2hook will notify you in Discord with "Reboot: Required" when a reboot is needed.
+// Mail2hook will notify you in Discord with a yellow alert bar and
+// "Reboot: Required" when a reboot is needed.
 // To enable automatic reboots when a kernel or core library update requires it:
 // Unattended-Upgrade::Automatic-Reboot "true";
 // Unattended-Upgrade::Automatic-Reboot-Time "03:00";
