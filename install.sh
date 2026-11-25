@@ -832,6 +832,49 @@ emit_master_cf_block() {
     printf '%s\n' "$POSTFIX_MASTER_END"
 }
 
+inspect_unmanaged_master_cf_entry() {
+    local master_cf_path="$1"
+    if [[ ! -f "$master_cf_path" ]]; then
+        return 1
+    fi
+
+    local any_entry_re='^[[:space:]]*mail2hook[[:space:]]+unix([[:space:]]|$)'
+    local entry_count
+    entry_count="$(grep -Ec "$any_entry_re" "$master_cf_path" || true)"
+    if [[ "$entry_count" -ne 1 ]]; then
+        return 1
+    fi
+
+    local col0_entry_re='^mail2hook[[:space:]]+unix([[:space:]]|$)'
+    local cont_re='^[[:space:]]+[^#[:space:]]'
+    local pipe_re='[[:space:]]pipe([[:space:]]|$)'
+    local argv_re='[[:space:]]argv=([^[:space:]]*/)?mail2hook([[:space:]]|$)'
+
+    local in_entry=0 found_col0=0 joined_entry="" line
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        if [[ "$in_entry" -eq 1 ]]; then
+            if [[ "$line" =~ $cont_re ]]; then
+                joined_entry="${joined_entry} ${line}"
+                continue
+            fi
+            break
+        fi
+        if [[ "$line" =~ $col0_entry_re ]]; then
+            found_col0=1
+            in_entry=1
+            joined_entry="$line"
+        fi
+    done < "$master_cf_path"
+
+    if [[ "$found_col0" -ne 1 ]]; then
+        return 1
+    fi
+    if [[ "$joined_entry" =~ $pipe_re ]] && [[ "$joined_entry" =~ $argv_re ]]; then
+        return 0
+    fi
+    return 1
+}
+
 update_master_cf_block() {
     local master_cf_path="$1"
     local pipe_user="$2"
@@ -839,7 +882,7 @@ update_master_cf_block() {
     local bin_path="$4"
     local backup_dir="${5:-}"
 
-    local has_begin=0 has_end=0
+    local has_begin=0 has_end=0 adopt_unmanaged=0
     if [[ -f "$master_cf_path" ]]; then
         grep -Fq "$POSTFIX_MASTER_BEGIN" "$master_cf_path" && has_begin=1 || true
         grep -Fq "$POSTFIX_MASTER_END" "$master_cf_path" && has_end=1 || true
@@ -852,8 +895,12 @@ update_master_cf_block() {
 
     if [[ "$has_begin" -eq 0 && -f "$master_cf_path" ]]; then
         if grep -Eq '^[[:space:]]*mail2hook[[:space:]]+unix([[:space:]]|$)' "$master_cf_path"; then
-            log_warn "Found unmanaged 'mail2hook' transport in $master_cf_path; leaving existing entry untouched."
-            return 1
+            if inspect_unmanaged_master_cf_entry "$master_cf_path"; then
+                adopt_unmanaged=1
+            else
+                log_warn "Found unmanaged 'mail2hook' transport in $master_cf_path; leaving existing entry untouched."
+                return 1
+            fi
         fi
     fi
 
@@ -861,10 +908,18 @@ update_master_cf_block() {
     tmp_file="$(mktemp "${master_cf_path}.tmp.XXXXXX")"
     register_cleanup_path "$tmp_file"
 
-    local in_block=0 replaced=0 last_line="" line_count=0 line
+    local col0_entry_re='^mail2hook[[:space:]]+unix([[:space:]]|$)'
+    local cont_re='^[[:space:]]+[^#[:space:]]'
+    local in_block=0 in_unmanaged=0 replaced=0 last_line="" line_count=0 line
     if [[ -f "$master_cf_path" ]]; then
         while IFS= read -r line || [[ -n "$line" ]]; do
             line_count=$((line_count + 1))
+            if [[ "$in_unmanaged" -eq 1 ]]; then
+                if [[ "$line" =~ $cont_re ]]; then
+                    continue
+                fi
+                in_unmanaged=0
+            fi
             if [[ "$line" == "$POSTFIX_MASTER_BEGIN" ]]; then
                 emit_master_cf_block "$pipe_user" "$env_group" "$bin_path" >> "$tmp_file"
                 in_block=1
@@ -875,6 +930,12 @@ update_master_cf_block() {
                 if [[ "$line" == "$POSTFIX_MASTER_END" ]]; then
                     in_block=0
                 fi
+                continue
+            fi
+            if [[ "$adopt_unmanaged" -eq 1 && "$line" =~ $col0_entry_re ]]; then
+                emit_master_cf_block "$pipe_user" "$env_group" "$bin_path" >> "$tmp_file"
+                in_unmanaged=1
+                replaced=1
                 continue
             fi
             printf '%s\n' "$line" >> "$tmp_file"
@@ -899,7 +960,12 @@ update_master_cf_block() {
     fi
     chmod 0644 "$tmp_file"
     mv -f "$tmp_file" "$master_cf_path"
-    record_change "Configured mail2hook pipe transport in $master_cf_path"
+    if [[ "$adopt_unmanaged" -eq 1 ]]; then
+        log_info "Adopted existing unmanaged 'mail2hook' pipe transport in $master_cf_path into managed block."
+        record_change "Adopted unmanaged mail2hook pipe transport into managed block in $master_cf_path"
+    else
+        record_change "Configured mail2hook pipe transport in $master_cf_path"
+    fi
     return 0
 }
 

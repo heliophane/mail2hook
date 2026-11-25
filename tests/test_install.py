@@ -114,6 +114,113 @@ def test_master_cf_block_insert_idempotent_and_remove(tmp_path: Path) -> None:
     assert len(list(backup_dir.glob("*.bak"))) == 2
 
 
+def test_master_cf_adopts_unmanaged_mail2hook_pipe_and_rejects_ambiguous(tmp_path: Path) -> None:
+    # 1. Manual README-style unmanaged entry is adopted cleanly, idempotently, and removable
+    master_cf = tmp_path / "master.cf"
+    backup_dir = tmp_path / "backups"
+    manual_entry = (
+        "smtp      inet  n       -       y       -       -       smtpd\n"
+        "# Custom comment\n"
+        "mail2hook unix  -       n       n       -       -       pipe\n"
+        "  flags=R user=nobody:mail "
+        "argv=/usr/local/bin/mail2hook -oi -f ${sender} -- ${recipient}\n"
+        "local     unix  -       n       n       -       -       local\n"
+    )
+    master_cf.write_text(manual_entry, encoding="utf-8")
+
+    res1 = _run_install_fn(
+        f'update_master_cf_block "{master_cf}" "nobody" "mail" '
+        f'"/usr/local/bin/mail2hook" "{backup_dir}"'
+    )
+    assert res1.returncode == 0, res1.stderr
+    assert "Adopted existing unmanaged 'mail2hook' pipe transport" in res1.stdout
+    adopted = master_cf.read_text(encoding="utf-8")
+    assert adopted == (
+        "smtp      inet  n       -       y       -       -       smtpd\n"
+        "# Custom comment\n"
+        "# BEGIN mail2hook managed block\n"
+        "mail2hook unix  -       n       n       -       -       pipe\n"
+        "  flags=R user=nobody:mail "
+        "argv=/usr/local/bin/mail2hook -oi -f ${sender} -- ${recipient}\n"
+        "# END mail2hook managed block\n"
+        "local     unix  -       n       n       -       -       local\n"
+    )
+    assert len(list(backup_dir.glob("*.bak"))) == 1
+
+    # Second run is idempotent and makes no extra backup
+    res2 = _run_install_fn(
+        f'update_master_cf_block "{master_cf}" "nobody" "mail" '
+        f'"/usr/local/bin/mail2hook" "{backup_dir}"'
+    )
+    assert res2.returncode == 0, res2.stderr
+    assert master_cf.read_text(encoding="utf-8") == adopted
+    assert len(list(backup_dir.glob("*.bak"))) == 1
+
+    # Uninstall removes adopted block cleanly
+    res3 = _run_install_fn(f'remove_master_cf_block "{master_cf}" "{backup_dir}"')
+    assert res3.returncode == 0, res3.stderr
+    assert master_cf.read_text(encoding="utf-8") == (
+        "smtp      inet  n       -       y       -       -       smtpd\n"
+        "# Custom comment\n"
+        "local     unix  -       n       n       -       -       local\n"
+    )
+
+    # 2. Legacy multi-line unmanaged entry (venv path) is adopted and upgraded cleanly
+    legacy_cf = tmp_path / "legacy_master.cf"
+    legacy_backup = tmp_path / "legacy_backups"
+    legacy_cf.write_text(
+        "smtp      inet  n       -       y       -       -       smtpd\n"
+        "mail2hook unix  -       n       n       -       -       pipe\n"
+        "  flags=FR user=mail2hook\n"
+        "  argv=/opt/mail2hook/venv/bin/mail2hook\n",
+        encoding="utf-8",
+    )
+    res_legacy = _run_install_fn(
+        f'update_master_cf_block "{legacy_cf}" "nobody" "mail" '
+        f'"/usr/local/bin/mail2hook" "{legacy_backup}"'
+    )
+    assert res_legacy.returncode == 0, res_legacy.stderr
+    legacy_updated = legacy_cf.read_text(encoding="utf-8")
+    assert "/opt/mail2hook/venv/bin/mail2hook" not in legacy_updated
+    assert "flags=FR user=mail2hook" not in legacy_updated
+    assert legacy_updated.count("# BEGIN mail2hook managed block") == 1
+    assert "user=nobody:mail argv=/usr/local/bin/mail2hook" in legacy_updated
+
+    # 3. Custom / non-mail2hook transport is refused without modifying master.cf or backing up
+    custom_cf = tmp_path / "custom_master.cf"
+    custom_backup = tmp_path / "custom_backups"
+    custom_content = (
+        "mail2hook unix  -       n       n       -       -       pipe\n"
+        "  flags=R user=nobody:mail argv=/usr/local/bin/custom-wrapper\n"
+    )
+    custom_cf.write_text(custom_content, encoding="utf-8")
+    res_custom = _run_install_fn(
+        f'update_master_cf_block "{custom_cf}" "nobody" "mail" '
+        f'"/usr/local/bin/mail2hook" "{custom_backup}"'
+    )
+    assert res_custom.returncode == 1
+    assert "Found unmanaged 'mail2hook' transport" in res_custom.stderr
+    assert custom_cf.read_text(encoding="utf-8") == custom_content
+    assert not custom_backup.exists()
+
+    # 4. Duplicate unmanaged mail2hook entries are refused without modifying master.cf
+    dup_cf = tmp_path / "dup_master.cf"
+    dup_content = (
+        "mail2hook unix  -       n       n       -       -       pipe\n"
+        "  argv=/usr/local/bin/mail2hook\n"
+        "mail2hook unix  -       n       n       -       -       pipe\n"
+        "  argv=/usr/local/bin/mail2hook\n"
+    )
+    dup_cf.write_text(dup_content, encoding="utf-8")
+    res_dup = _run_install_fn(
+        f'update_master_cf_block "{dup_cf}" "nobody" "mail" '
+        f'"/usr/local/bin/mail2hook" "{custom_backup}"'
+    )
+    assert res_dup.returncode == 1
+    assert "Found unmanaged 'mail2hook' transport" in res_dup.stderr
+    assert dup_cf.read_text(encoding="utf-8") == dup_content
+
+
 def test_transport_map_value_helpers(tmp_path: Path) -> None:
     tfile = "/etc/postfix/mail2hook_transport"
     spec = f"hash:{tfile}"
