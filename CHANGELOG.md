@@ -5,6 +5,12 @@ All notable changes to `mail2hook` are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.6.1] - 2026-11-25
+
+### Fixed
+
+- `install.sh` now safely adopts an existing unmanaged `mail2hook` Postfix `pipe` transport in `/etc/postfix/master.cf` (e.g. from manual setup or earlier versions) into the managed `# BEGIN mail2hook managed block` / `# END mail2hook managed block` section after saving a backup, while continuing to refuse ambiguous, duplicate, or non-`mail2hook` entries.
+
 ## [0.6.0] - 2026-11-25
 
 ### Added
@@ -37,5 +43,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Hardened HTTP webhook delivery (disabled 3xx redirects, `429` `retry_after` deadline/jitter handling, `408`/Cloudflare `403` retries, bounded error reads, and `redact_webhook_url` / `redact_secrets` sanitization).
 - Hardened configuration loading (ignored CWD `.env` when running as `root` or when `/etc/mail2hook/env` exists, surfaced `EACCES` directory errors, failed on missing `--env-file`, and validated `DISCORD_USERNAME`).
 
+[0.6.1]: https://github.com/heliophane/mail2hook/compare/v0.6.0...v0.6.1
 [0.6.0]: https://github.com/heliophane/mail2hook/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/heliophane/mail2hook/releases/tag/v0.5.0
